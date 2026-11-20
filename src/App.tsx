@@ -67,6 +67,7 @@ type GeminiConnectionStatus =
   | "network"
   | "timeout"
   | "api_error"
+  | "server_error"
   | "cleared";
 
 const HISTORY_KEY = "mockforge.attempts";
@@ -221,7 +222,7 @@ function App() {
         signal: controller.signal,
       });
       if (!response.ok) {
-        setGeminiConnectionStatus("api_error");
+        setGeminiConnectionStatus(response.status >= 500 ? "server_error" : "api_error");
         return;
       }
       const result: unknown = await response.json().catch(() => undefined);
@@ -229,7 +230,7 @@ function App() {
         ? result.status
         : undefined;
       const knownStatuses: Exclude<GeminiConnectionStatus, "idle" | "testing" | "cleared">[] = [
-        "connected", "invalid_key", "quota", "network", "timeout", "api_error",
+        "connected", "invalid_key", "quota", "network", "timeout", "api_error", "server_error",
       ];
       setGeminiConnectionStatus(knownStatuses.find((status) => status === resultStatus) ?? "api_error");
     } catch {
@@ -983,6 +984,7 @@ function App() {
             {geminiConnectionStatus === "quota" && "The key is valid, but its Gemini quota or rate limit has been reached."}
             {geminiConnectionStatus === "network" && "Could not reach Google Gemini. Check your network connection and try again."}
             {geminiConnectionStatus === "timeout" && "The connection test timed out. Try again in a moment."}
+            {geminiConnectionStatus === "server_error" && "MockForge's server could not complete the connection test. Try again later."}
             {geminiConnectionStatus === "api_error" && (window.location.protocol !== "https:" && !["localhost", "127.0.0.1", "::1", "[::1]"].includes(window.location.hostname)
               ? "Use a secure HTTPS connection to test your API key."
               : "Google Gemini could not complete the connection test. Check the key's API access and try again.")}

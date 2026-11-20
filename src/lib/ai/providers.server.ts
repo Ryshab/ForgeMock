@@ -1,4 +1,4 @@
-import { getProviderTimeoutMs } from "./timeouts.server";
+import { getProviderTimeoutMs } from "./timeouts.server.js";
 
 export type ExtractionPage = {
   page: number;
