@@ -5,6 +5,7 @@ export const config = {
   api: {
     bodyParser: false,
   },
+  maxDuration: 190,
 };
 
 export default async function handler(request: IncomingMessage, response: ServerResponse): Promise<void> {

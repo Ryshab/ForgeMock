@@ -213,6 +213,11 @@ function App() {
 
     const controller = new AbortController();
     geminiTestControllerRef.current = controller;
+    let timedOut = false;
+    const timeout = setTimeout(() => {
+      timedOut = true;
+      controller.abort();
+    }, 180_000);
     setGeminiConnectionStatus("testing");
     try {
       const response = await fetch("/api/ai/test-gemini", {
@@ -234,8 +239,10 @@ function App() {
       ];
       setGeminiConnectionStatus(knownStatuses.find((status) => status === resultStatus) ?? "api_error");
     } catch {
-      if (!controller.signal.aborted) setGeminiConnectionStatus("network");
+      if (timedOut) setGeminiConnectionStatus("timeout");
+      else if (!controller.signal.aborted) setGeminiConnectionStatus("network");
     } finally {
+      clearTimeout(timeout);
       if (geminiTestControllerRef.current === controller) geminiTestControllerRef.current = null;
     }
   };
