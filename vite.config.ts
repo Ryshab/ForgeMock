@@ -3,6 +3,7 @@ import react from "@vitejs/plugin-react";
 import tailwindcss from "@tailwindcss/vite";
 import { loadEnv } from "vite";
 import { aiExtractionMiddleware } from "./src/lib/ai-extraction.functions";
+import { geminiValidationMiddleware } from "./src/lib/gemini-validation.functions";
 import { getExtractionHttpTimeoutMs } from "./src/lib/ai/timeouts.server";
 
 export default defineConfig(({ mode }) => {
@@ -35,10 +36,12 @@ export default defineConfig(({ mode }) => {
         configureServer(server) {
           configureHttpTimeout(server.httpServer);
           server.middlewares.use("/api/ai/extract", aiExtractionMiddleware);
+          server.middlewares.use("/api/ai/test-gemini", geminiValidationMiddleware);
         },
         configurePreviewServer(server) {
           configureHttpTimeout(server.httpServer);
           server.middlewares.use("/api/ai/extract", aiExtractionMiddleware);
+          server.middlewares.use("/api/ai/test-gemini", geminiValidationMiddleware);
         },
       },
     ],

@@ -9,6 +9,10 @@ type ProviderConfig =
   | { kind: "gemini"; key: string; model: string }
   | { kind: "lovable"; key: string; model: "google/gemini-2.5-flash" };
 
+export type GeminiConnectionTestResult =
+  | { status: "connected"; message: string }
+  | { status: "invalid_key" | "quota" | "network" | "timeout" | "api_error"; message: string };
+
 type ProviderRequest = {
   url: string;
   headers: Record<string, string>;
@@ -32,13 +36,17 @@ export class ClientCancelledError extends Error {
   }
 }
 
+function getGeminiModel(): string {
+  return process.env.GEMINI_MODEL?.trim() || "gemini-2.5-flash";
+}
+
 function getProvider(): ProviderConfig {
   const geminiKey = process.env.GEMINI_API_KEY?.trim();
   if (geminiKey) {
     return {
       kind: "gemini",
       key: geminiKey,
-      model: process.env.GEMINI_MODEL?.trim() || "gemini-2.5-flash",
+      model: getGeminiModel(),
     };
   }
 
@@ -51,6 +59,72 @@ function getProvider(): ProviderConfig {
     "AI extraction is not configured. Set GEMINI_API_KEY on the server, or set LOVABLE_API_KEY to use the Lovable AI fallback.",
     503,
   );
+}
+
+function getGeminiErrorStatus(payload: unknown): string {
+  if (!payload || typeof payload !== "object" || !("error" in payload)) return "";
+  const error = payload.error;
+  if (!error || typeof error !== "object") return "";
+  return "status" in error && typeof error.status === "string" ? error.status : "";
+}
+
+function getGeminiErrorMessage(payload: unknown): string {
+  if (!payload || typeof payload !== "object" || !("error" in payload)) return "";
+  const error = payload.error;
+  if (!error || typeof error !== "object") return "";
+  return "message" in error && typeof error.message === "string" ? error.message : "";
+}
+
+function classifyGeminiError(statusCode: number, payload: unknown): GeminiConnectionTestResult {
+  const status = getGeminiErrorStatus(payload).toUpperCase();
+  const message = getGeminiErrorMessage(payload).toLowerCase();
+  if (
+    status === "API_KEY_INVALID" ||
+    (statusCode === 401) ||
+    (/api.?key/.test(message) && /(invalid|not valid|incorrect)/.test(message))
+  ) {
+    return { status: "invalid_key", message: "Google rejected this API key. Check that it is correct and active." };
+  }
+  if (
+    statusCode === 429 ||
+    status === "RESOURCE_EXHAUSTED" ||
+    /(quota|rate.?limit|resource exhausted)/.test(message)
+  ) {
+    return { status: "quota", message: "The key is valid, but its Gemini quota or rate limit has been reached." };
+  }
+  return { status: "api_error", message: "Google Gemini could not complete the connection test. Check the key's API access and try again." };
+}
+
+export async function testGeminiApiKey(apiKey: string): Promise<GeminiConnectionTestResult> {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 15_000);
+  try {
+    const response = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(getGeminiModel())}:generateContent`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-goog-api-key": apiKey,
+        },
+        body: JSON.stringify({
+          contents: [{ parts: [{ text: "Reply with OK." }] }],
+          generationConfig: { maxOutputTokens: 1 },
+        }),
+        signal: controller.signal,
+      },
+    );
+    if (response.ok) return { status: "connected", message: "Connection successful. The API key is valid." };
+    const payload: unknown = await response.json().catch(() => undefined);
+    return classifyGeminiError(response.status, payload);
+  } catch {
+    if (controller.signal.aborted) {
+      return { status: "timeout", message: "The connection test timed out. Try again in a moment." };
+    }
+    return { status: "network", message: "Could not reach Google Gemini. Check your network connection and try again." };
+  } finally {
+    clearTimeout(timeout);
+  }
 }
 
 function getRequest(provider: ProviderConfig, prompt: string, pages: ExtractionPage[]): ProviderRequest {
