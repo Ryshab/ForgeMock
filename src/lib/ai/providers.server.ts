@@ -21,6 +21,12 @@ type ProviderRequest = {
   body: unknown;
 };
 
+type GeminiExtractionDiagnostics = {
+  finishReason?: string;
+  candidateCount: number;
+  candidateTextExists: boolean;
+};
+
 export class ProviderRequestError extends Error {
   constructor(
     message: string,
@@ -42,7 +48,19 @@ function getGeminiModel(): string {
   return process.env.GEMINI_MODEL?.trim() || "gemini-2.5-flash";
 }
 
-function getProvider(): ProviderConfig {
+function getProvider(apiKey?: string): ProviderConfig {
+  if (apiKey !== undefined) {
+    const userKey = apiKey.trim();
+    if (!userKey) {
+      throw new ProviderRequestError("Enter a Gemini API key in Settings to use Gemini.", 400);
+    }
+    return {
+      kind: "gemini",
+      key: userKey,
+      model: getGeminiModel(),
+    };
+  }
+
   const geminiKey = process.env.GEMINI_API_KEY?.trim();
   if (geminiKey) {
     return {
@@ -58,7 +76,7 @@ function getProvider(): ProviderConfig {
   }
 
   throw new ProviderRequestError(
-    "AI extraction is not configured. Set GEMINI_API_KEY on the server, or set LOVABLE_API_KEY to use the Lovable AI fallback.",
+    "No AI provider is configured. Add a Gemini API key in Settings or configure a server-side provider.",
     503,
   );
 }
@@ -95,6 +113,24 @@ function classifyGeminiError(statusCode: number, payload: unknown): GeminiConnec
     return { status: "quota", message: "The key is valid, but its Gemini quota or rate limit has been reached." };
   }
   return { status: "api_error", message: "Google Gemini could not complete the connection test. Check the key's API access and try again." };
+}
+
+function getGeminiExtractionErrorMessage(statusCode: number, responseText: string): string {
+  let payload: unknown;
+  try {
+    payload = JSON.parse(responseText) as unknown;
+  } catch {
+    payload = undefined;
+  }
+
+  const result = classifyGeminiError(statusCode, payload);
+  if (result.status === "invalid_key") {
+    return "The Gemini API key is invalid. Check the key in Settings.";
+  }
+  if (result.status === "quota") {
+    return "The Gemini quota or rate limit was reached. Try again later.";
+  }
+  return "Google Gemini could not complete PDF extraction. Check the key's API access and try again.";
 }
 
 export async function testGeminiApiKey(apiKey: string): Promise<GeminiConnectionTestResult> {
@@ -212,8 +248,11 @@ async function requestProvider(
       if (transient && attempt < maxAttempts) {
         retry = true;
       } else {
+        const message = providerName === "Gemini"
+          ? getGeminiExtractionErrorMessage(response.status, responseText)
+          : `${providerName} request failed (${response.status}): ${responseText.slice(0, 400) || response.statusText}`;
         throw new ProviderRequestError(
-          `${providerName} request failed (${response.status}): ${responseText.slice(0, 400) || response.statusText}`,
+          message,
           response.status >= 500 ? 502 : response.status,
         );
       }
@@ -230,7 +269,9 @@ async function requestProvider(
       if (attempt < maxAttempts) {
         retry = true;
       } else {
-        const detail = reason instanceof Error ? reason.message : String(reason);
+        const detail = providerName === "Gemini"
+          ? "Check the network connection and try again."
+          : reason instanceof Error ? reason.message : String(reason);
         throw new ProviderRequestError(`${providerName} network request failed: ${detail}`, 502);
       }
     } finally {
@@ -250,11 +291,54 @@ async function requestProvider(
   );
 }
 
-function parseJsonResponse(text: string, providerName = "The AI provider"): unknown {
+function parseJsonResponse(
+  text: string,
+  providerName = "The AI provider",
+  geminiDiagnostics?: GeminiExtractionDiagnostics,
+): unknown {
+  const trimmedText = text.trim();
+  const openingFenceStripped = /^```(?:json)?\s*/i.test(trimmedText);
+  const closingFenceStripped = /\s*```$/.test(trimmedText);
   const cleanText = text.trim().replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "");
   try {
     return JSON.parse(cleanText) as unknown;
-  } catch {
+  } catch (error) {
+    if (geminiDiagnostics) {
+      const cleanTrimmedText = cleanText.trim();
+      const startsWithObjectBrace = cleanTrimmedText.startsWith("{");
+      const endsWithObjectBrace = cleanTrimmedText.endsWith("}");
+      const parseErrorMessage = error instanceof SyntaxError ? error.message : "";
+      const jsonErrorCategory = error instanceof SyntaxError
+        ? parseErrorMessage.toLowerCase().includes("unexpected end")
+          ? "unexpected_end"
+          : parseErrorMessage.toLowerCase().includes("unterminated string")
+            ? "unterminated_string"
+            : parseErrorMessage.toLowerCase().includes("unexpected token")
+              ? "unexpected_token"
+              : parseErrorMessage.toLowerCase().includes("expected")
+                ? "invalid_structure"
+                : "syntax_error"
+        : "unknown";
+      const positionMatch = /\bposition\s+(\d+)\b/i.exec(parseErrorMessage);
+
+      console.error("Gemini extraction JSON parsing failed", {
+        finishReason: geminiDiagnostics.finishReason ?? "UNKNOWN",
+        candidateCount: geminiDiagnostics.candidateCount,
+        candidateTextExists: geminiDiagnostics.candidateTextExists,
+        extractedResponseTextLength: text.length,
+        markdownCodeFenceDetectedAndStripped: openingFenceStripped || closingFenceStripped,
+        startsWithObjectBrace,
+        endsWithObjectBrace,
+        jsonErrorCategory,
+        jsonErrorPosition: positionMatch ? Number(positionMatch[1]) : null,
+        appearsTruncated:
+          geminiDiagnostics.finishReason === "MAX_TOKENS" ||
+          geminiDiagnostics.finishReason === "CONTINUATION" ||
+          jsonErrorCategory === "unexpected_end" ||
+          jsonErrorCategory === "unterminated_string" ||
+          (startsWithObjectBrace && !endsWithObjectBrace),
+      });
+    }
     throw new ProviderRequestError(
       `${providerName} returned malformed extraction JSON. No questions were accepted.`,
       502,
@@ -274,7 +358,10 @@ function providerReason(value: unknown): string | undefined {
     : undefined;
 }
 
-function extractGeminiText(parsed: unknown): string {
+function extractGeminiText(parsed: unknown): {
+  text: string;
+  diagnostics: GeminiExtractionDiagnostics;
+} {
   const response = asRecord(parsed);
   if (!response) {
     throw new ProviderRequestError(
@@ -371,15 +458,23 @@ function extractGeminiText(parsed: unknown): string {
       502,
     );
   }
-  return text;
+  return {
+    text,
+    diagnostics: {
+      finishReason,
+      candidateCount: response.candidates.length,
+      candidateTextExists: true,
+    },
+  };
 }
 
 export async function generateQuestionExtraction(
   prompt: string,
   pages: ExtractionPage[],
   clientSignal: AbortSignal,
+  apiKey?: string,
 ): Promise<unknown> {
-  const provider = getProvider();
+  const provider = getProvider(apiKey);
   const request = getRequest(provider, prompt, pages);
   const providerName = provider.kind === "gemini" ? "Gemini" : "Lovable AI";
   const responseText = await requestProvider(
@@ -404,7 +499,7 @@ export async function generateQuestionExtraction(
 
   if (provider.kind === "gemini") {
     const output = extractGeminiText(result);
-    return parseJsonResponse(output, "Gemini");
+    return parseJsonResponse(output.text, "Gemini", output.diagnostics);
   }
 
   const payload = result as { choices?: { message?: { content?: string | { text?: string }[] } }[] };

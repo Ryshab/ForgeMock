@@ -5,12 +5,14 @@ import {
   ClientCancelledError,
   generateQuestionExtraction,
   ProviderRequestError,
-} from "./ai/providers.server";
-import type { ExtractionPage } from "./ai/providers.server";
+} from "./ai/providers.server.js";
+import type { ExtractionPage } from "./ai/providers.server.js";
+import { isSecureRequest } from "./gemini-validation.server.js";
 
 type ExtractionRequest = {
   prompt: string;
   pages: ExtractionPage[];
+  apiKey?: string;
 };
 
 export class ExtractionRequestError extends Error {
@@ -55,6 +57,7 @@ export function aiExtractionMiddleware(
   request: IncomingMessage,
   response: ServerResponse,
   next: NextFunction,
+  options: { timeoutMs?: number } = {},
 ): void {
   if (request.method === "OPTIONS") {
     response.statusCode = 204;
@@ -67,20 +70,56 @@ export function aiExtractionMiddleware(
   }
 
   const controller = new AbortController();
+  let clientDisconnected = false;
+  let timedOut = false;
   const abortOnDisconnect = () => {
-    if (!response.writableEnded) controller.abort();
+    if (!response.writableEnded) {
+      clientDisconnected = true;
+      controller.abort();
+    }
   };
   request.once("aborted", abortOnDisconnect);
   response.once("close", abortOnDisconnect);
+  const timeout = options.timeoutMs === undefined
+    ? undefined
+    : setTimeout(() => {
+      timedOut = true;
+      controller.abort();
+    }, options.timeoutMs);
 
   void (async () => {
     try {
       const body = await readRequestBody(request);
-      if (controller.signal.aborted) return;
+      if (
+        body !== null &&
+        typeof body === "object" &&
+        "apiKey" in body &&
+        !isSecureRequest(request)
+      ) {
+        throw new ExtractionRequestError(
+          "Use HTTPS to send a Gemini API key. Localhost is allowed for development.",
+          400,
+        );
+      }
+      if (controller.signal.aborted) {
+        if (timedOut && !response.destroyed) {
+          respond(response, 504, { error: "AI extraction timed out before the function duration limit." });
+        }
+        return;
+      }
       const result = await extractQuestionsOnServer(body, controller.signal);
-      if (!controller.signal.aborted && !response.destroyed) respond(response, 200, result);
+      if (timedOut && !response.destroyed) {
+        respond(response, 504, { error: "AI extraction timed out before the function duration limit." });
+      } else if (!controller.signal.aborted && !response.destroyed) {
+        respond(response, 200, result);
+      }
     } catch (reason) {
-      if (reason instanceof ClientCancelledError || controller.signal.aborted || response.destroyed) return;
+      if (clientDisconnected || response.destroyed) return;
+      if (timedOut) {
+        respond(response, 504, { error: "AI extraction timed out before the function duration limit." });
+        return;
+      }
+      if (reason instanceof ClientCancelledError || controller.signal.aborted) return;
       if (reason instanceof RequestBodyError || reason instanceof ExtractionRequestError) {
         respond(response, reason.statusCode, { error: reason.message });
         return;
@@ -89,10 +128,9 @@ export function aiExtractionMiddleware(
         respond(response, reason.statusCode, { error: reason.message });
         return;
       }
-      respond(response, 500, {
-        error: `AI extraction failed unexpectedly: ${reason instanceof Error ? reason.message : String(reason)}`,
-      });
+      respond(response, 500, { error: "AI extraction failed unexpectedly. Try again." });
     } finally {
+      if (timeout !== undefined) clearTimeout(timeout);
       request.removeListener("aborted", abortOnDisconnect);
       response.removeListener("close", abortOnDisconnect);
     }
@@ -107,6 +145,12 @@ export async function extractQuestionsOnServer(
     throw new ExtractionRequestError("Request body must be a JSON object.", 400);
   }
   const request = input as Partial<ExtractionRequest>;
+  if (
+    "apiKey" in request &&
+    (typeof request.apiKey !== "string" || !request.apiKey.trim())
+  ) {
+    throw new ExtractionRequestError("Enter a valid Gemini API key in Settings.", 400);
+  }
   if (
     typeof request.prompt !== "string" ||
     request.prompt.length === 0 ||
@@ -123,12 +167,14 @@ export async function extractQuestionsOnServer(
   }
 
   try {
-    return await generateQuestionExtraction(request.prompt, request.pages, signal);
+    return await generateQuestionExtraction(
+      request.prompt,
+      request.pages,
+      signal,
+      typeof request.apiKey === "string" ? request.apiKey.trim() : undefined,
+    );
   } catch (reason) {
     if (reason instanceof ClientCancelledError || reason instanceof ProviderRequestError) throw reason;
-    throw new ProviderRequestError(
-      `AI extraction failed unexpectedly: ${reason instanceof Error ? reason.message : String(reason)}`,
-      502,
-    );
+    throw new ProviderRequestError("AI extraction failed unexpectedly. Try again.", 502);
   }
 }

@@ -13,7 +13,7 @@ export class GeminiValidationRequestError extends Error {
   }
 }
 
-function isSecureRequest(request: IncomingMessage): boolean {
+export function isSecureRequest(request: IncomingMessage): boolean {
   if (request.socket instanceof TLSSocket) return true;
   const forwardedProto = request.headers["x-forwarded-proto"];
   if (typeof forwardedProto === "string" && forwardedProto.split(",")[0].trim() === "https") return true;
