@@ -71,6 +71,7 @@ type GeminiConnectionStatus =
 
 const HISTORY_KEY = "mockforge.attempts";
 const THEME_KEY = "mockforge.theme";
+const GEMINI_CONNECTION_TEST_TIMEOUT_MS = 180_000;
 const MIN_QUESTION_ZOOM = 70;
 const MAX_QUESTION_ZOOM = 150;
 const QUESTION_ZOOM_STEP = 10;
@@ -213,6 +214,11 @@ function App() {
     const controller = new AbortController();
     geminiTestControllerRef.current = controller;
     setGeminiConnectionStatus("testing");
+    let timedOut = false;
+    const timeout = setTimeout(() => {
+      timedOut = true;
+      controller.abort();
+    }, GEMINI_CONNECTION_TEST_TIMEOUT_MS);
     try {
       const response = await fetch("/api/ai/test-gemini", {
         method: "POST",
@@ -233,8 +239,13 @@ function App() {
       ];
       setGeminiConnectionStatus(knownStatuses.find((status) => status === resultStatus) ?? "api_error");
     } catch {
-      if (!controller.signal.aborted) setGeminiConnectionStatus("network");
+      if (timedOut) {
+        setGeminiConnectionStatus("timeout");
+      } else if (!controller.signal.aborted) {
+        setGeminiConnectionStatus("network");
+      }
     } finally {
+      clearTimeout(timeout);
       if (geminiTestControllerRef.current === controller) geminiTestControllerRef.current = null;
     }
   };

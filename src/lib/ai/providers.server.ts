@@ -1,5 +1,7 @@
 import { getProviderTimeoutMs } from "./timeouts.server";
 
+const GEMINI_CONNECTION_TEST_TIMEOUT_MS = 170_000;
+
 export type ExtractionPage = {
   page: number;
   data: string;
@@ -97,7 +99,7 @@ function classifyGeminiError(statusCode: number, payload: unknown): GeminiConnec
 
 export async function testGeminiApiKey(apiKey: string): Promise<GeminiConnectionTestResult> {
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 15_000);
+  const timeout = setTimeout(() => controller.abort(), GEMINI_CONNECTION_TEST_TIMEOUT_MS);
   try {
     const response = await fetch(
       `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(getGeminiModel())}:generateContent`,
