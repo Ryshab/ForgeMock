@@ -8,6 +8,28 @@ import {
 import DOMPurify from "dompurify";
 import katex from "katex";
 import pdfWorker from "pdfjs-dist/build/pdf.worker.min.mjs?url";
+import {
+  createStableId,
+  savePdfRecord,
+  addExtraction,
+  addMockTest,
+  getMockTest,
+  listMockTests,
+  addAttempt,
+  updateAttempt,
+  listAttempts,
+  deleteAttempt,
+  getAttempt,
+  listPdfs,
+  getPdf,
+  updatePdf,
+  deletePdf,
+  updateMockTest,
+  deleteMockTest,
+  getSetting,
+  setSetting,
+} from "./lib/storage";
+import type { AttemptRecord, AttemptQuestionState, AttemptScore, ExtractionRecord, MockTestRecord, PdfRecord, StoredQuestion } from "./lib/storage";
 
 let pdfJsPromise: Promise<typeof import("pdfjs-dist")> | undefined;
 
@@ -53,6 +75,7 @@ type Attempt = {
   negativeMarks: number;
   elapsedSeconds: number;
   questions: Question[];
+  untracked?: boolean;
 };
 type ExtractedQuestion = {
   questionText: string;
@@ -159,6 +182,7 @@ function App() {
   const [settings, setSettings] = useState<ExamSettings>(initialSettings);
   const [customOverride, setCustomOverride] = useState(false);
   const [file, setFile] = useState<File | null>(null);
+  const [savedPdfId, setSavedPdfId] = useState<string | null>(null);
   const [pageCount, setPageCount] = useState(0);
   const [startPage, setStartPage] = useState(1);
   const [endPage, setEndPage] = useState(1);
@@ -170,7 +194,7 @@ function App() {
   const [questions, setQuestions] = useState<Question[]>([]);
   const [activeIndex, setActiveIndex] = useState(0);
   const [questionZoom, setQuestionZoom] = useState(100);
-  const [view, setView] = useState<"setup" | "ready" | "exam" | "results">("setup");
+  const [view, setView] = useState<"setup" | "library" | "ready" | "exam" | "results">("setup");
   const [secondsLeft, setSecondsLeft] = useState(0);
   const [elapsedSeconds, setElapsedSeconds] = useState(0);
   const [apiModal, setApiModal] = useState(false);
@@ -180,12 +204,40 @@ function App() {
   const [storageWarning, setStorageWarning] = useState("");
   const [reviewFilter, setReviewFilter] = useState("All");
   const [mobilePaletteOpen, setMobilePaletteOpen] = useState(false);
+  const [savedMocks, setSavedMocks] = useState<MockTestRecord[]>([]);
+  const [libraryLoading, setLibraryLoading] = useState(false);
+  const [currentMockId, setCurrentMockId] = useState<string | null>(null);
+  const [startingAttempt, setStartingAttempt] = useState(false);
+  const [untrackedPractice, setUntrackedPractice] = useState(false);
+  const [completedAttemptCounts, setCompletedAttemptCounts] = useState<Record<string, number>>({});
+  const [latestAttemptDates, setLatestAttemptDates] = useState<Record<string, number>>({});
+  const [unfinishedAttempts, setUnfinishedAttempts] = useState<AttemptRecord[]>([]);
+  const [savedPdfs, setSavedPdfs] = useState<PdfRecord[]>([]);
+  const [migrationStatus, setMigrationStatus] = useState<"idle" | "running" | "complete" | "failed">("idle");
+  const [autosaveRevision, setAutosaveRevision] = useState(0);
   const activeQuestionRef = useRef(0);
   const submittedRef = useRef(false);
   const extractionInFlightRef = useRef(false);
   const extractionControllerRef = useRef<AbortController | null>(null);
   const pdfInputRef = useRef<HTMLInputElement>(null);
   const examInitializedRef = useRef(false);
+  const pdfUploadSequenceRef = useRef(0);
+  const pdfPersistenceQueueRef = useRef<Promise<void>>(Promise.resolve());
+  const savedMockOpenSequenceRef = useRef(0);
+  const activeAttemptIdRef = useRef<string | null>(null);
+  const activeAttemptStartedAtRef = useRef<number | null>(null);
+  const activeAttemptMockTestIdRef = useRef<string | null>(null);
+  const attemptCreationInFlightRef = useRef(false);
+  const untrackedPracticeRef = useRef(false);
+  const autosaveQueueRef = useRef<Promise<void>>(Promise.resolve());
+  const autosavePausedRef = useRef(false);
+  const autosaveTimerRef = useRef<number | null>(null);
+  const activeAttemptSnapshotRef = useRef<AttemptRecord | null>(null);
+  const latestQuestionsRef = useRef<Question[]>([]);
+  const latestElapsedRef = useRef(0);
+  const latestRemainingRef = useRef(0);
+  const latestActiveIndexRef = useRef(0);
+  const latestSettingsRef = useRef(settings);
 
   useEffect(() => {
     document.documentElement.dataset.theme = theme;
@@ -196,26 +248,622 @@ function App() {
     }
   }, [theme]);
 
+  useEffect(() => {
+    void listAttempts().then((records) => {
+      setUnfinishedAttempts(records
+        .filter((record) => record.status === "in-progress")
+        .sort((left, right) => right.updatedAt - left.updatedAt));
+    }).catch((reason) => {
+      const detail = reason instanceof Error ? reason.message : String(reason);
+      setStorageWarning(`Could not check for unfinished attempts: ${detail}`);
+    });
+  }, []);
+
+  useEffect(() => {
+    void migrateLegacyHistory();
+  }, []);
+
+  useEffect(() => {
+    void listPdfs().then(setSavedPdfs).catch((reason) => {
+      const detail = reason instanceof Error ? reason.message : String(reason);
+      setStorageWarning(`Could not load saved PDFs: ${detail}`);
+    });
+  }, []);
+
   const toggleTheme = () => setTheme((current) => current === "dark" ? "light" : "dark");
   const patchSettings = (patch: Partial<ExamSettings>) => setSettings((current) => ({ ...current, ...patch }));
+  latestQuestionsRef.current = questions;
+  latestElapsedRef.current = elapsedSeconds;
+  latestRemainingRef.current = secondsLeft;
+  latestActiveIndexRef.current = activeIndex;
+  latestSettingsRef.current = settings;
+  const migrateLegacyHistory = async () => {
+    if (migrationStatus === "running") return;
+    setMigrationStatus("running");
+    try {
+      const marker = await getSetting("legacy-attempt-migration-v1");
+      if (marker === "completed") {
+        setMigrationStatus("complete");
+        return;
+      }
+      let legacy: unknown = [];
+      try {
+        legacy = JSON.parse(localStorage.getItem(HISTORY_KEY) ?? "[]");
+      } catch {
+        setMigrationStatus("failed");
+        setStorageWarning("Legacy attempt history was malformed and could not be migrated.");
+        return;
+      }
+      if (!Array.isArray(legacy)) {
+        setMigrationStatus("failed");
+        setStorageWarning("Legacy attempt history was incompatible and could not be migrated.");
+        return;
+      }
+      for (const candidate of legacy) {
+        if (!candidate || typeof candidate !== "object") continue;
+        const item = candidate as Record<string, unknown>;
+        if (
+          typeof item.id !== "string" ||
+          typeof item.completedAt !== "string" ||
+          typeof item.sectionName !== "string" ||
+          typeof item.tier !== "string" ||
+          typeof item.elapsedSeconds !== "number" ||
+          !Array.isArray(item.questions)
+        ) continue;
+        const existing = await getAttempt(item.id);
+        if (existing) continue;
+        const completedAt = Date.parse(item.completedAt);
+        if (!Number.isFinite(completedAt)) continue;
+        const positiveMarks = typeof item.positiveMarks === "number" ? item.positiveMarks : 0;
+        const negativeMarks = typeof item.negativeMarks === "number" ? item.negativeMarks : 0;
+        const tier = item.tier === "Tier 2" ? "Tier 2" : "Tier 1";
+        const sectionName = item.sectionName;
+        const legacyQuestions: Question[] = [];
+        for (const questionCandidate of item.questions) {
+          if (!questionCandidate || typeof questionCandidate !== "object") continue;
+          const question = questionCandidate as Record<string, unknown>;
+          if (
+            typeof question.id !== "string" ||
+            typeof question.questionText !== "string" ||
+            !Array.isArray(question.options) ||
+            typeof question.correctOptionIndex !== "number"
+          ) continue;
+          legacyQuestions.push({
+            id: question.id,
+            questionText: question.questionText,
+            options: question.options.filter((option): option is string => typeof option === "string"),
+            correctOptionIndex: question.correctOptionIndex,
+            ...(typeof question.passageText === "string" ? { passageText: question.passageText } : {}),
+            selectedOption: typeof question.selectedOption === "number" ? question.selectedOption : undefined,
+            visited: typeof question.visited === "boolean" ? question.visited : false,
+            marked: typeof question.marked === "boolean" ? question.marked : false,
+            timeSpentSeconds: typeof question.timeSpentSeconds === "number" ? question.timeSpentSeconds : 0,
+          });
+        }
+        if (!legacyQuestions.length) continue;
+        const mockId = `legacy-mock-${item.id}`;
+        if (!await getMockTest(mockId)) {
+          const storedQuestions: StoredQuestion[] = legacyQuestions.map((question, index) => ({
+            id: question.id,
+            order: index,
+            subject: tier === "Tier 2" ? sectionName : undefined,
+            questionText: question.questionText,
+            options: [...question.options],
+            correctOptionIndex: question.correctOptionIndex,
+            passageText: question.passageText,
+            formatVersion: 1,
+          }));
+          await addMockTest({
+            id: mockId,
+            name: `Migrated · ${sectionName}`,
+            exam: {
+              tier,
+              examName: "SSC CGL",
+              subject: sectionName,
+              selectedSubjects: tier === "Tier 1" ? [] : [sectionName],
+              expectedQuestions: legacyQuestions.length,
+              positiveMarks,
+              negativeMarks,
+              timerMinutes: tier === "Tier 1" ? 60 : 35,
+              untimed: false,
+              sectionName,
+              navigationRules: { allowPrevious: true, allowNext: true, allowMarkForReview: true },
+            },
+            questions: storedQuestions,
+            questionOrder: storedQuestions.map((question) => question.id),
+            createdAt: completedAt,
+            updatedAt: completedAt,
+          });
+        }
+        const legacyAttempt: Attempt = {
+          id: item.id,
+          completedAt: item.completedAt,
+          sectionName,
+          tier,
+          positiveMarks,
+          negativeMarks,
+          elapsedSeconds: item.elapsedSeconds,
+          questions: legacyQuestions,
+        };
+        const score = getScore(legacyAttempt);
+        const storedQuestions: StoredQuestion[] = legacyQuestions.map((question, index) => ({
+          id: question.id,
+          order: index,
+          subject: tier === "Tier 2" ? sectionName : undefined,
+          questionText: question.questionText,
+          options: [...question.options],
+          correctOptionIndex: question.correctOptionIndex,
+          passageText: question.passageText,
+          formatVersion: 1,
+        }));
+        const states: AttemptQuestionState[] = legacyQuestions.map((question) => ({
+          questionId: question.id,
+          selectedOption: question.selectedOption,
+          visited: question.visited,
+          marked: question.marked,
+          timeSpentSeconds: question.timeSpentSeconds,
+        }));
+        const attemptRecord: AttemptRecord = {
+          id: item.id,
+          mockTestId: mockId,
+          status: "completed",
+          startedAt: completedAt - item.elapsedSeconds * 1000,
+          completedAt,
+          mockName: `Migrated · ${sectionName}`,
+          exam: {
+            tier,
+            examName: "SSC CGL",
+            subject: sectionName,
+            selectedSubjects: tier === "Tier 1" ? [] : [sectionName],
+            expectedQuestions: legacyQuestions.length,
+            positiveMarks,
+            negativeMarks,
+            timerMinutes: tier === "Tier 1" ? 60 : 35,
+            untimed: false,
+            sectionName,
+            navigationRules: { allowPrevious: true, allowNext: true, allowMarkForReview: true },
+          },
+          questions: storedQuestions,
+          questionOrder: storedQuestions.map((question) => question.id),
+          answers: states,
+          questionStates: states,
+          activeQuestionIndex: legacyQuestions.length - 1,
+          remainingSeconds: 0,
+          elapsedSeconds: item.elapsedSeconds,
+          perQuestionTiming: Object.fromEntries(legacyQuestions.map((question) => [question.id, question.timeSpentSeconds])),
+          score: {
+            correct: score.correct,
+            wrong: score.wrong,
+            attempted: score.attempted,
+            unattempted: score.unattempted,
+            positiveEarned: score.positiveEarned,
+            negativeLost: score.negativeLost,
+            net: score.net,
+            max: score.max,
+            accuracy: score.accuracy,
+            totalTime: score.totalTime,
+            averageTime: score.averageTime,
+          },
+          createdAt: completedAt - item.elapsedSeconds * 1000,
+          updatedAt: completedAt,
+        };
+        await addAttempt(attemptRecord);
+      }
+      await setSetting("legacy-attempt-migration-v1", "completed");
+      setMigrationStatus("complete");
+    } catch (reason) {
+      setMigrationStatus("failed");
+      const detail = reason instanceof Error ? reason.message : String(reason);
+      setStorageWarning(`Attempt migration did not complete: ${detail}`);
+    }
+  };
+  const openLibrary = async () => {
+    setLibraryLoading(true);
+    setStorageWarning("");
+    try {
+      const [mocks, attempts, pdfs] = await Promise.all([listMockTests(), listAttempts(), listPdfs()]);
+      setSavedMocks([...mocks].sort((left, right) => right.createdAt - left.createdAt));
+      setSavedPdfs([...pdfs].sort((left, right) => right.createdAt - left.createdAt));
+      const counts: Record<string, number> = {};
+      const latest: Record<string, number> = {};
+      for (const attempt of attempts) {
+        if (attempt.status !== "completed" || !attempt.completedAt) continue;
+        counts[attempt.mockTestId] = (counts[attempt.mockTestId] ?? 0) + 1;
+        latest[attempt.mockTestId] = Math.max(latest[attempt.mockTestId] ?? 0, attempt.completedAt);
+      }
+      setCompletedAttemptCounts(counts);
+      setLatestAttemptDates(latest);
+    } catch (reason) {
+      setSavedMocks([]);
+      const detail = reason instanceof Error ? reason.message : String(reason);
+      setStorageWarning(`Could not load the saved mock library: ${detail}`);
+    } finally {
+      setLibraryLoading(false);
+      setView("library");
+    }
+  };
+  const renamePdf = async (pdf: PdfRecord) => {
+    const nextName = window.prompt("Rename PDF", pdf.filename)?.trim();
+    if (!nextName || nextName === pdf.filename) return;
+    try {
+      if (!await getPdf(pdf.id)) {
+        setSavedPdfs((current) => current.filter((item) => item.id !== pdf.id));
+        setStorageWarning("This PDF was already deleted.");
+        return;
+      }
+      const updated = { ...pdf, filename: nextName, updatedAt: Date.now() };
+      await updatePdf(updated);
+      setSavedPdfs((current) => current.map((item) => item.id === pdf.id ? updated : item));
+    } catch (reason) {
+      const detail = reason instanceof Error ? reason.message : String(reason);
+      setStorageWarning(`Could not rename the PDF: ${detail}`);
+    }
+  };
+  const deletePdfRecord = async (pdf: PdfRecord) => {
+    if (!window.confirm(`Delete "${pdf.filename}"? Saved mocks and attempts will remain available.`)) return;
+    try {
+      await deletePdf(pdf.id);
+      setSavedPdfs((current) => current.filter((item) => item.id !== pdf.id));
+      if (savedPdfId === pdf.id) setSavedPdfId(null);
+    } catch (reason) {
+      const detail = reason instanceof Error ? reason.message : String(reason);
+      setStorageWarning(`Could not delete the PDF: ${detail}`);
+    }
+  };
+  const renameMock = async (mock: MockTestRecord) => {
+    const nextName = window.prompt("Rename saved mock", mock.name)?.trim();
+    if (!nextName || nextName === mock.name) return;
+    try {
+      if (!await getMockTest(mock.id)) {
+        setSavedMocks((current) => current.filter((item) => item.id !== mock.id));
+        setStorageWarning("This saved mock was already deleted.");
+        return;
+      }
+      const updated = { ...mock, name: nextName, updatedAt: Date.now() };
+      await updateMockTest(updated);
+      setSavedMocks((current) => current.map((item) => item.id === mock.id ? updated : item));
+    } catch (reason) {
+      const detail = reason instanceof Error ? reason.message : String(reason);
+      setStorageWarning(`Could not rename the saved mock: ${detail}`);
+    }
+  };
+  const deleteMockRecord = async (mock: MockTestRecord) => {
+    if (!window.confirm(`Delete "${mock.name}"? Completed attempts and their history will remain available.`)) return;
+    try {
+      await deleteMockTest(mock.id);
+      savedMockOpenSequenceRef.current += 1;
+      setSavedMocks((current) => current.filter((item) => item.id !== mock.id));
+      if (currentMockId === mock.id) setCurrentMockId(null);
+    } catch (reason) {
+      const detail = reason instanceof Error ? reason.message : String(reason);
+      setStorageWarning(`Could not delete the saved mock: ${detail}`);
+    }
+  };
+  const discardUnfinishedAttempt = async (attemptId: string) => {
+    if (!window.confirm("Discard this unfinished attempt? Completed attempts will not be removed.")) return;
+    try {
+      await deleteAttempt(attemptId);
+      setUnfinishedAttempts((current) => current.filter((attempt) => attempt.id !== attemptId));
+    } catch (reason) {
+      const detail = reason instanceof Error ? reason.message : String(reason);
+      setStorageWarning(`Could not discard the unfinished attempt: ${detail}`);
+    }
+  };
+  const resumeUnfinishedAttempt = async (attempt: AttemptRecord) => {
+    if (activeAttemptIdRef.current) {
+      setStorageWarning("Finish or leave the current attempt before resuming another.");
+      return;
+    }
+    try {
+      let storedQuestions = attempt.questions;
+      if (!storedQuestions?.length) {
+        const mock = await getMockTest(attempt.mockTestId);
+        if (!mock) throw new Error("The source mock was deleted and this attempt has no saved question snapshot.");
+        storedQuestions = mock.questions;
+      }
+      if (!storedQuestions?.length) throw new Error("This unfinished attempt has no restorable question data.");
+      const orderedIds = attempt.questionOrder?.length
+        ? attempt.questionOrder
+        : storedQuestions.map((question) => question.id);
+      const orderedQuestions = orderedIds
+        .map((questionId) => storedQuestions?.find((question) => question.id === questionId))
+        .filter((question): question is StoredQuestion => Boolean(question));
+      const remaining = storedQuestions.filter((question) => !orderedIds.includes(question.id));
+      const states = attempt.questionStates?.length ? attempt.questionStates : attempt.answers;
+      const stateById = new Map(states.map((state) => [state.questionId, state]));
+      const runtimeQuestions: Question[] = [...orderedQuestions, ...remaining].map((question) => {
+        const state = stateById.get(question.id);
+        return {
+          id: question.id,
+          questionText: question.questionText,
+          options: [...question.options],
+          correctOptionIndex: question.correctOptionIndex,
+          passageText: question.passageText,
+          selectedOption: state?.selectedOption,
+          visited: state?.visited ?? false,
+          marked: state?.marked ?? false,
+          timeSpentSeconds: state?.timeSpentSeconds ?? 0,
+        };
+      });
+      const exam = attempt.exam;
+      if (exam) {
+        setSettings({
+          ...exam,
+          subject: exam.subject,
+          selectedSubjects: [...exam.selectedSubjects],
+        });
+      }
+      setQuestions(runtimeQuestions);
+      setActiveIndex(Math.max(0, Math.min(attempt.activeQuestionIndex, runtimeQuestions.length - 1)));
+      activeQuestionRef.current = Math.max(0, Math.min(attempt.activeQuestionIndex, runtimeQuestions.length - 1));
+      setElapsedSeconds(attempt.elapsedSeconds);
+      latestElapsedRef.current = attempt.elapsedSeconds;
+      setSecondsLeft(attempt.exam?.untimed ? 0 : attempt.remainingSeconds);
+      latestRemainingRef.current = attempt.exam?.untimed ? 0 : attempt.remainingSeconds;
+      setCurrentMockId(attempt.mockTestId);
+      activeAttemptIdRef.current = attempt.id;
+      activeAttemptStartedAtRef.current = attempt.startedAt;
+      activeAttemptMockTestIdRef.current = attempt.mockTestId;
+      activeAttemptSnapshotRef.current = attempt;
+      untrackedPracticeRef.current = false;
+      setUntrackedPractice(false);
+      submittedRef.current = false;
+      examInitializedRef.current = true;
+      autosavePausedRef.current = false;
+      setWarning("");
+      setStorageWarning("");
+      setUnfinishedAttempts((current) => current.filter((item) => item.id !== attempt.id));
+      setView("exam");
+    } catch (reason) {
+      const detail = reason instanceof Error ? reason.message : String(reason);
+      setStorageWarning(`Could not resume this unfinished attempt: ${detail}`);
+    }
+  };
+  const saveActiveAttemptCheckpoint = (): Promise<void> => {
+    const attemptId = activeAttemptIdRef.current;
+    if (!attemptId || untrackedPracticeRef.current || autosavePausedRef.current) return Promise.resolve();
+    const operation = autosaveQueueRef.current
+      .catch(() => undefined)
+      .then(async () => {
+        if (!activeAttemptIdRef.current || activeAttemptIdRef.current !== attemptId) return;
+        const snapshot = activeAttemptSnapshotRef.current;
+        if (!snapshot) return;
+        const now = Date.now();
+        const currentSettings = latestSettingsRef.current;
+        const currentQuestions = latestQuestionsRef.current;
+        const states: AttemptQuestionState[] = currentQuestions.map((question) => ({
+          questionId: question.id,
+          selectedOption: question.selectedOption,
+          visited: question.visited,
+          marked: question.marked,
+          timeSpentSeconds: question.timeSpentSeconds,
+        }));
+        const checkpoint: AttemptRecord = {
+          ...snapshot,
+          status: "in-progress",
+          mockName: snapshot.mockName ?? (currentSettings.sectionName || (currentSettings.tier === "Tier 1" ? `${currentSettings.examName} Tier 1` : currentSettings.subject)),
+          exam: {
+            tier: currentSettings.tier,
+            examName: currentSettings.examName,
+            subject: currentSettings.subject,
+            selectedSubjects: [...currentSettings.selectedSubjects],
+            expectedQuestions: currentSettings.expectedQuestions,
+            positiveMarks: currentSettings.positiveMarks,
+            negativeMarks: currentSettings.negativeMarks,
+            timerMinutes: currentSettings.timerMinutes,
+            untimed: currentSettings.untimed,
+            sectionName: currentSettings.sectionName,
+            navigationRules: {
+              allowPrevious: true,
+              allowNext: true,
+              allowMarkForReview: true,
+            },
+          },
+          answers: states,
+          questionStates: states,
+          activeQuestionIndex: latestActiveIndexRef.current,
+          remainingSeconds: currentSettings.untimed ? 0 : latestRemainingRef.current,
+          elapsedSeconds: latestElapsedRef.current,
+          perQuestionTiming: Object.fromEntries(currentQuestions.map((question) => [question.id, question.timeSpentSeconds])),
+          updatedAt: now,
+        };
+        try {
+          await updateAttempt(checkpoint);
+          activeAttemptSnapshotRef.current = checkpoint;
+          setStorageWarning("");
+        } catch (reason) {
+          if (activeAttemptIdRef.current !== attemptId) return;
+          const detail = reason instanceof Error ? reason.message : String(reason);
+          setStorageWarning(`Could not autosave this attempt. Your current exam remains usable; retry by continuing or submitting. ${detail}`);
+        }
+      });
+    autosaveQueueRef.current = operation;
+    return operation;
+  };
+  const openSavedMock = async (mockTestId: string) => {
+    const openSequence = ++savedMockOpenSequenceRef.current;
+    try {
+      const mock = await getMockTest(mockTestId);
+      if (savedMockOpenSequenceRef.current !== openSequence) return;
+      if (!mock) {
+        setStorageWarning("This saved mock could not be found.");
+        return;
+      }
+      const orderedQuestions = mock.questionOrder
+        .map((questionId) => mock.questions.find((question) => question.id === questionId))
+        .filter((question): question is StoredQuestion => Boolean(question));
+      const remainingQuestions = mock.questions.filter((question) =>
+        !mock.questionOrder.includes(question.id),
+      );
+      const runtimeQuestions: Question[] = [...orderedQuestions, ...remainingQuestions].map((question) => ({
+        id: question.id,
+        questionText: question.questionText,
+        options: [...question.options],
+        correctOptionIndex: question.correctOptionIndex,
+        passageText: question.passageText,
+        visited: false,
+        marked: false,
+        timeSpentSeconds: 0,
+      }));
+      setSettings({
+        ...mock.exam,
+        subject: mock.exam.subject,
+        selectedSubjects: [...mock.exam.selectedSubjects],
+      });
+      setQuestions(runtimeQuestions);
+      setActiveIndex(0);
+      activeQuestionRef.current = 0;
+      setQuestionZoom(100);
+      setElapsedSeconds(0);
+      setSecondsLeft(mock.exam.untimed ? 0 : mock.exam.timerMinutes * 60);
+      setCurrentMockId(mock.id);
+      untrackedPracticeRef.current = false;
+      setUntrackedPractice(false);
+      activeAttemptIdRef.current = null;
+      activeAttemptStartedAtRef.current = null;
+      activeAttemptMockTestIdRef.current = null;
+      activeAttemptSnapshotRef.current = null;
+      autosavePausedRef.current = false;
+      examInitializedRef.current = false;
+      submittedRef.current = false;
+      setWarning("");
+      setStorageWarning("");
+      setView("ready");
+    } catch (reason) {
+      if (savedMockOpenSequenceRef.current !== openSequence) return;
+      const detail = reason instanceof Error ? reason.message : String(reason);
+      setStorageWarning(`Could not open this saved mock: ${detail}`);
+    }
+  };
   const getTier1Structure = (subjects: string[]) => ({
     expectedQuestions: subjects.length * 25,
     timerMinutes: subjects.length * 15,
   });
-  const startExam = () => {
-    if (view !== "ready" || questions.length === 0 || examInitializedRef.current) return;
-    examInitializedRef.current = true;
-    setActiveIndex(0);
-    activeQuestionRef.current = 0;
-    setQuestionZoom(100);
-    setElapsedSeconds(0);
-    setSecondsLeft(settings.untimed ? 0 : settings.timerMinutes * 60);
-    setQuestions((current) => current.map((question, index) =>
-      index === 0 ? { ...question, visited: true } : question,
-    ));
-    submittedRef.current = false;
+  const createAttemptAndEnter = async (questionSet: Question[], mockTestId: string | null) => {
+    if (attemptCreationInFlightRef.current) return;
+    attemptCreationInFlightRef.current = true;
+    if (!mockTestId) {
+      activeAttemptIdRef.current = null;
+      activeAttemptStartedAtRef.current = null;
+      activeAttemptMockTestIdRef.current = null;
+      untrackedPracticeRef.current = true;
+      setUntrackedPractice(true);
+      const freshQuestions = questionSet.map((question) => ({
+        ...question,
+        selectedOption: undefined,
+        visited: false,
+        marked: false,
+        timeSpentSeconds: 0,
+      }));
+      freshQuestions[0] = { ...freshQuestions[0], visited: true };
+      examInitializedRef.current = true;
+      setActiveIndex(0);
+      activeQuestionRef.current = 0;
+      setQuestionZoom(100);
+      setElapsedSeconds(0);
+      setSecondsLeft(settings.untimed ? 0 : settings.timerMinutes * 60);
+      setQuestions(freshQuestions);
+      submittedRef.current = false;
+      setWarning("Untracked Practice — this session will not appear in saved attempt history.");
+      setView("exam");
+      attemptCreationInFlightRef.current = false;
+      setStartingAttempt(false);
+      return;
+    }
+    setStartingAttempt(true);
     setWarning("");
-    setView("exam");
+    untrackedPracticeRef.current = false;
+    setUntrackedPractice(false);
+    activeAttemptIdRef.current = null;
+    activeAttemptStartedAtRef.current = null;
+    activeAttemptMockTestIdRef.current = null;
+    try {
+      const now = Date.now();
+      const freshQuestions = questionSet.map((question) => ({
+        ...question,
+        selectedOption: undefined,
+        visited: false,
+        marked: false,
+        timeSpentSeconds: 0,
+      }));
+      freshQuestions[0] = { ...freshQuestions[0], visited: true };
+      const questionStates: AttemptQuestionState[] = freshQuestions.map((question) => ({
+        questionId: question.id,
+        selectedOption: undefined,
+        visited: question.visited,
+        marked: question.marked,
+        timeSpentSeconds: question.timeSpentSeconds,
+      }));
+      const storedQuestionSnapshot: StoredQuestion[] = freshQuestions.map((question, index) => ({
+        id: question.id,
+        order: index,
+        subject: settings.tier === "Tier 2" ? settings.subject : undefined,
+        questionText: question.questionText,
+        options: [...question.options],
+        correctOptionIndex: question.correctOptionIndex,
+        passageText: question.passageText,
+        formatVersion: 1,
+      }));
+      const attempt: AttemptRecord = {
+        id: createStableId("attempt"),
+        mockTestId,
+        status: "in-progress",
+        startedAt: now,
+        mockName: settings.sectionName || (settings.tier === "Tier 1" ? `${settings.examName} Tier 1` : settings.subject),
+        exam: {
+          tier: settings.tier,
+          examName: settings.examName,
+          subject: settings.subject,
+          selectedSubjects: [...settings.selectedSubjects],
+          expectedQuestions: settings.expectedQuestions,
+          positiveMarks: settings.positiveMarks,
+          negativeMarks: settings.negativeMarks,
+          timerMinutes: settings.timerMinutes,
+          untimed: settings.untimed,
+          sectionName: settings.sectionName,
+          navigationRules: {
+            allowPrevious: true,
+            allowNext: true,
+            allowMarkForReview: true,
+          },
+        },
+        answers: questionStates,
+        questionStates,
+        questions: storedQuestionSnapshot,
+        questionOrder: storedQuestionSnapshot.map((question) => question.id),
+        activeQuestionIndex: 0,
+        remainingSeconds: settings.untimed ? 0 : settings.timerMinutes * 60,
+        elapsedSeconds: 0,
+        perQuestionTiming: Object.fromEntries(freshQuestions.map((question) => [question.id, 0])),
+        createdAt: now,
+        updatedAt: now,
+      };
+      const savedAttempt = await addAttempt(attempt);
+      activeAttemptIdRef.current = savedAttempt.id;
+      activeAttemptStartedAtRef.current = savedAttempt.startedAt;
+      activeAttemptMockTestIdRef.current = mockTestId;
+      activeAttemptSnapshotRef.current = savedAttempt;
+      examInitializedRef.current = true;
+      setActiveIndex(0);
+      activeQuestionRef.current = 0;
+      setQuestionZoom(100);
+      setElapsedSeconds(0);
+      setSecondsLeft(settings.untimed ? 0 : settings.timerMinutes * 60);
+      setQuestions(freshQuestions);
+      submittedRef.current = false;
+      setWarning("");
+      setView("exam");
+    } catch (reason) {
+      const detail = reason instanceof Error ? reason.message : String(reason);
+      setWarning(`Could not create a tracked attempt. Please retry. ${detail}`);
+    } finally {
+      attemptCreationInFlightRef.current = false;
+      setStartingAttempt(false);
+    }
+  };
+  const startExam = async () => {
+    if (view !== "ready" || questions.length === 0 || examInitializedRef.current || startingAttempt) return;
+    await createAttemptAndEnter(questions, currentMockId);
   };
   const applyTier = (tier: Tier) => {
     if (tier === "Tier 1") {
@@ -256,30 +904,80 @@ function App() {
     if (!enabled) applyTier(settings.tier);
   };
 
+  const persistPdfLocally = async (selected: File, pageCountLoaded: number, uploadSequence: number) => {
+    const operation = pdfPersistenceQueueRef.current
+      .catch(() => undefined)
+      .then(async () => {
+        if (pdfUploadSequenceRef.current !== uploadSequence) return;
+        const now = Date.now();
+        try {
+          const record: PdfRecord = {
+            id: createStableId("pdf"),
+            filename: selected.name,
+            size: selected.size,
+            pageCount: pageCountLoaded,
+            lastModified: selected.lastModified,
+            blob: selected,
+            createdAt: now,
+            updatedAt: now,
+          };
+
+          const savedRecord = await savePdfRecord(record);
+          if (pdfUploadSequenceRef.current !== uploadSequence) return;
+          setSavedPdfId(savedRecord.id);
+          setStorageWarning("");
+        } catch (reason) {
+          if (pdfUploadSequenceRef.current !== uploadSequence) return;
+          setSavedPdfId(null);
+          const detail = reason instanceof Error ? reason.message : String(reason);
+          const quotaError = reason instanceof DOMException &&
+            (reason.name === "QuotaExceededError" || reason.name === "NS_ERROR_DOM_QUOTA_REACHED");
+          setStorageWarning(
+            quotaError
+              ? "The PDF is available for this session, but local storage is full and could not save it."
+              : `The PDF is available for this session, but could not be saved locally: ${detail}`,
+          );
+        }
+      });
+    pdfPersistenceQueueRef.current = operation;
+    await operation;
+  };
+
   const loadFile = async (selected: File | undefined) => {
     if (!selected) return;
+    const uploadSequence = ++pdfUploadSequenceRef.current;
     setError("");
     setWarning("");
+    setStorageWarning("");
     setFile(null);
+    setSavedPdfId(null);
     setPageCount(0);
     if (selected.size > 50 * 1024 * 1024) {
-      setError("This PDF is larger than 50 MB. Choose a smaller response sheet.");
+      if (pdfUploadSequenceRef.current === uploadSequence) {
+        setError("This PDF is larger than 50 MB. Choose a smaller response sheet.");
+      }
       return;
     }
     if (selected.type !== "application/pdf" && !selected.name.toLowerCase().endsWith(".pdf")) {
-      setError("Please choose a PDF response sheet.");
+      if (pdfUploadSequenceRef.current === uploadSequence) {
+        setError("Please choose a PDF response sheet.");
+      }
       return;
     }
     try {
       const data = await selected.arrayBuffer();
       const pdfjsLib = await loadPdfJs();
       const pdf = await pdfjsLib.getDocument({ data }).promise;
+      if (pdfUploadSequenceRef.current !== uploadSequence) return;
       setFile(selected);
       setPageCount(pdf.numPages);
       setStartPage(1);
       setEndPage(Math.min(pdf.numPages, 5));
+      void persistPdfLocally(selected, pdf.numPages, uploadSequence);
     } catch (reason) {
-      setError(`Could not read this PDF: ${reason instanceof Error ? reason.message : String(reason)}`);
+      if (pdfUploadSequenceRef.current === uploadSequence) {
+        setError(`Could not read this PDF: ${reason instanceof Error ? reason.message : String(reason)}`);
+      }
     }
   };
 
@@ -360,6 +1058,12 @@ function App() {
     }
     setError("");
     setWarning("");
+    setCurrentMockId(null);
+    untrackedPracticeRef.current = false;
+    setUntrackedPractice(false);
+    activeAttemptIdRef.current = null;
+    activeAttemptStartedAtRef.current = null;
+    activeAttemptMockTestIdRef.current = null;
     setBusy(true);
     extractionInFlightRef.current = true;
     const controller = new AbortController();
@@ -390,8 +1094,8 @@ function App() {
       const extractedForStructure = settings.tier === "Tier 1"
         ? extracted.slice(0, settings.expectedQuestions)
         : extracted;
-      const normalized: Question[] = extractedForStructure.map((question, index) => ({
-        id: `${Date.now()}-${index}`,
+      const normalized: Question[] = extractedForStructure.map((question) => ({
+        id: createStableId("question"),
         questionText: scrubArtifacts(question.questionText),
         options: question.options.slice(0, 4).map(scrubArtifacts),
         correctOptionIndex: question.correctOptionIndex,
@@ -400,14 +1104,118 @@ function App() {
         marked: false,
         timeSpentSeconds: 0,
       }));
+      if (normalized.length !== settings.expectedQuestions) {
+        setWarning(`Expected ${settings.expectedQuestions} questions, but found ${normalized.length}. Review the section before starting.`);
+      }
+      let savedExtractionId: string | undefined;
+      if (!controller.signal.aborted) {
+        const passageIds = new Map<string, string>();
+        const storedQuestions: StoredQuestion[] = normalized.map((question, index) => {
+          let passageId: string | undefined;
+          if (question.passageText) {
+            const existingPassageId = passageIds.get(question.passageText);
+            passageId = existingPassageId ?? `passage-${passageIds.size + 1}`;
+            if (!existingPassageId) passageIds.set(question.passageText, passageId);
+          }
+          return {
+            id: question.id,
+            order: index,
+            subject: settings.tier === "Tier 2" ? settings.subject : undefined,
+            questionText: question.questionText,
+            options: question.options,
+            correctOptionIndex: question.correctOptionIndex,
+            passageId,
+            passageText: question.passageText,
+            clozeGroupId: passageId,
+            formatVersion: 1,
+          };
+        });
+        const extraction: ExtractionRecord = {
+          id: createStableId("extraction"),
+          sourcePdfId: savedPdfId ?? undefined,
+          sourcePdfFilename: file.name,
+          startPage,
+          endPage,
+          provider: "Server AI",
+          selectedSubjects: settings.tier === "Tier 1" ? [...settings.selectedSubjects] : [settings.subject],
+          examName: settings.examName,
+          tier: settings.tier,
+          sectionName: settings.sectionName,
+          questions: storedQuestions,
+          warning: normalized.length !== settings.expectedQuestions
+            ? `Expected ${settings.expectedQuestions} questions, but found ${normalized.length}.`
+            : undefined,
+          createdAt: Date.now(),
+        };
+        try {
+          await addExtraction(extraction);
+          savedExtractionId = extraction.id;
+        } catch (reason) {
+          const detail = reason instanceof Error ? reason.message : String(reason);
+          const storageMessage = `The extraction is available for this session, but could not be saved locally: ${detail}`;
+          setStorageWarning(storageMessage);
+          setWarning((current) => current ? `${current} ${storageMessage}` : storageMessage);
+        }
+
+        const now = Date.now();
+        const mockName = settings.sectionName
+          ? settings.sectionName
+          : settings.tier === "Tier 1"
+            ? `${settings.examName} Tier 1 · ${normalized.length} questions`
+            : `${settings.subject} · ${normalized.length} questions`;
+        const mockTest: MockTestRecord = {
+          id: createStableId("mock"),
+          name: mockName,
+          exam: {
+            tier: settings.tier,
+            examName: settings.examName,
+            subject: settings.subject,
+            selectedSubjects: [...settings.selectedSubjects],
+            expectedQuestions: settings.expectedQuestions,
+            positiveMarks: settings.positiveMarks,
+            negativeMarks: settings.negativeMarks,
+            timerMinutes: settings.timerMinutes,
+            untimed: settings.untimed,
+            sectionName: settings.sectionName,
+            navigationRules: {
+              allowPrevious: true,
+              allowNext: true,
+              allowMarkForReview: true,
+            },
+          },
+          questions: storedQuestions,
+          questionOrder: storedQuestions.map((question) => question.id),
+          sourcePdfId: savedPdfId ?? undefined,
+          sourceExtractionId: savedExtractionId,
+          createdAt: now,
+          updatedAt: now,
+        };
+        try {
+          await addMockTest(mockTest);
+          setCurrentMockId(mockTest.id);
+          untrackedPracticeRef.current = false;
+          setUntrackedPractice(false);
+          activeAttemptIdRef.current = null;
+          activeAttemptStartedAtRef.current = null;
+          activeAttemptMockTestIdRef.current = mockTest.id;
+        } catch (reason) {
+          const detail = reason instanceof Error ? reason.message : String(reason);
+          const storageMessage = `The mock is available for this session, but could not be saved locally: ${detail}`;
+          setCurrentMockId(null);
+          untrackedPracticeRef.current = true;
+          setUntrackedPractice(true);
+          activeAttemptIdRef.current = null;
+          activeAttemptStartedAtRef.current = null;
+          activeAttemptMockTestIdRef.current = null;
+          setStorageWarning(storageMessage);
+          setWarning((current) => current ? `${current} ${storageMessage}` : storageMessage);
+        }
+      }
       setQuestions(normalized);
       setActiveIndex(0);
       activeQuestionRef.current = 0;
       submittedRef.current = false;
       examInitializedRef.current = false;
-      if (normalized.length !== settings.expectedQuestions) {
-        setWarning(`Expected ${settings.expectedQuestions} questions, but found ${normalized.length}. Review the section before starting.`);
-      }
       setView("ready");
     } catch (reason) {
       setError(controller.signal.aborted
@@ -426,19 +1234,113 @@ function App() {
     return () => extractionControllerRef.current?.abort();
   }, []);
 
-  const finishAttempt = useCallback(() => {
+  const finishAttempt = useCallback(async () => {
     if (submittedRef.current || questions.length === 0) return;
     submittedRef.current = true;
+    const completedAt = Date.now();
+    const untracked = untrackedPracticeRef.current;
+    if (!untracked && activeAttemptIdRef.current) {
+      autosavePausedRef.current = true;
+      await saveActiveAttemptCheckpoint();
+    }
     const attempt: Attempt = {
-      id: `${Date.now()}`,
-      completedAt: new Date().toISOString(),
+      id: untracked ? "" : activeAttemptIdRef.current ?? "",
+      completedAt: new Date(completedAt).toISOString(),
       sectionName: settings.sectionName || settings.subject,
       tier: settings.tier,
       positiveMarks: settings.positiveMarks,
       negativeMarks: settings.negativeMarks,
       elapsedSeconds,
       questions,
+      untracked,
     };
+    const score = getScore(attempt);
+    const attemptScore: AttemptScore = {
+      correct: score.correct,
+      wrong: score.wrong,
+      attempted: score.attempted,
+      unattempted: score.unattempted,
+      positiveEarned: score.positiveEarned,
+      negativeLost: score.negativeLost,
+      net: score.net,
+      max: score.max,
+      accuracy: score.accuracy,
+      totalTime: score.totalTime,
+      averageTime: score.averageTime,
+    };
+    const questionStates: AttemptQuestionState[] = questions.map((question) => ({
+      questionId: question.id,
+      selectedOption: question.selectedOption,
+      visited: question.visited,
+      marked: question.marked,
+      timeSpentSeconds: question.timeSpentSeconds,
+    }));
+    const persistentAttempt: AttemptRecord | null = activeAttemptIdRef.current
+      ? {
+          id: activeAttemptIdRef.current,
+          mockTestId: activeAttemptMockTestIdRef.current ?? "",
+          status: "completed",
+          startedAt: activeAttemptStartedAtRef.current ?? completedAt - elapsedSeconds * 1000,
+          completedAt,
+          mockName: settings.sectionName || (settings.tier === "Tier 1" ? `${settings.examName} Tier 1` : settings.subject),
+          exam: {
+            tier: settings.tier,
+            examName: settings.examName,
+            subject: settings.subject,
+            selectedSubjects: [...settings.selectedSubjects],
+            expectedQuestions: settings.expectedQuestions,
+            positiveMarks: settings.positiveMarks,
+            negativeMarks: settings.negativeMarks,
+            timerMinutes: settings.timerMinutes,
+            untimed: settings.untimed,
+            sectionName: settings.sectionName,
+            navigationRules: {
+              allowPrevious: true,
+              allowNext: true,
+              allowMarkForReview: true,
+            },
+          },
+          answers: questionStates,
+          questionStates,
+          activeQuestionIndex: activeIndex,
+          remainingSeconds: settings.untimed ? 0 : secondsLeft,
+          elapsedSeconds,
+          perQuestionTiming: Object.fromEntries(questions.map((question) => [question.id, question.timeSpentSeconds])),
+          score: attemptScore,
+          createdAt: activeAttemptStartedAtRef.current ?? completedAt - elapsedSeconds * 1000,
+          updatedAt: completedAt,
+        }
+      : null;
+
+    if (untracked) {
+      activeAttemptIdRef.current = null;
+      activeAttemptStartedAtRef.current = null;
+      activeAttemptMockTestIdRef.current = null;
+    } else if (persistentAttempt) {
+      try {
+        await updateAttempt(persistentAttempt);
+      } catch (reason) {
+        submittedRef.current = false;
+        autosavePausedRef.current = false;
+        const detail = reason instanceof Error ? reason.message : String(reason);
+        setWarning(`Could not save this attempt result. Please submit again. ${detail}`);
+        setSubmitModal(false);
+        return;
+      }
+    } else {
+      submittedRef.current = false;
+      setWarning("Could not identify this attempt. Return to the mock and start a tracked attempt again.");
+      setSubmitModal(false);
+      return;
+    }
+
+    activeAttemptIdRef.current = null;
+    activeAttemptStartedAtRef.current = null;
+    activeAttemptMockTestIdRef.current = null;
+    activeAttemptSnapshotRef.current = null;
+    autosavePausedRef.current = false;
+    untrackedPracticeRef.current = false;
+    setUntrackedPractice(false);
     const next = [attempt, ...readAttempts()].slice(0, 12);
     try {
       localStorage.setItem(HISTORY_KEY, JSON.stringify(next));
@@ -450,7 +1352,7 @@ function App() {
     setCurrentAttempt(attempt);
     setSubmitModal(false);
     setView("results");
-  }, [elapsedSeconds, questions, settings]);
+  }, [activeIndex, elapsedSeconds, currentMockId, questions, secondsLeft, settings]);
 
   useEffect(() => {
     if (view !== "exam" || questions.length === 0) return;
@@ -465,6 +1367,29 @@ function App() {
   }, [view, questions.length, settings.untimed]);
 
   useEffect(() => {
+    if (view !== "exam" || untrackedPracticeRef.current || !activeAttemptIdRef.current) return;
+    if (autosaveTimerRef.current !== null) window.clearTimeout(autosaveTimerRef.current);
+    autosaveTimerRef.current = window.setTimeout(() => {
+      autosaveTimerRef.current = null;
+      void saveActiveAttemptCheckpoint();
+    }, 350);
+    return () => {
+      if (autosaveTimerRef.current !== null) {
+        window.clearTimeout(autosaveTimerRef.current);
+        autosaveTimerRef.current = null;
+      }
+    };
+  }, [view, activeIndex, autosaveRevision]);
+
+  useEffect(() => {
+    if (view !== "exam" || untrackedPracticeRef.current || !activeAttemptIdRef.current) return;
+    const interval = window.setInterval(() => {
+      if (!autosavePausedRef.current) void saveActiveAttemptCheckpoint();
+    }, 10000);
+    return () => window.clearInterval(interval);
+  }, [view]);
+
+  useEffect(() => {
     if (view === "exam" && !settings.untimed && secondsLeft === 0 && elapsedSeconds > 0) finishAttempt();
   }, [elapsedSeconds, finishAttempt, secondsLeft, settings.untimed, view]);
 
@@ -472,6 +1397,7 @@ function App() {
     if (index < 0 || index >= questions.length) return;
     activeQuestionRef.current = index;
     setActiveIndex(index);
+    setAutosaveRevision((revision) => revision + 1);
     setQuestions((current) => current.map((question, questionIndex) =>
       questionIndex === index ? { ...question, visited: true } : question,
     ));
@@ -482,23 +1408,24 @@ function App() {
     setQuestions((current) => current.map((question, index) =>
       index === activeIndex ? { ...question, selectedOption: option } : question,
     ));
+    setAutosaveRevision((revision) => revision + 1);
   };
 
   const markAndNext = () => {
     setQuestions((current) => current.map((question, index) =>
       index === activeIndex ? { ...question, marked: true } : question,
     ));
+    setAutosaveRevision((revision) => revision + 1);
     if (activeIndex < questions.length - 1) changeQuestion(activeIndex + 1);
   };
 
-  const launchRetry = () => {
+  const launchRetry = async () => {
     if (!currentAttempt) return;
     const retry = currentAttempt.questions.filter((question) =>
       question.selectedOption !== question.correctOptionIndex ||
       question.timeSpentSeconds > 90,
     ).map((question, index) => ({
       ...question,
-      id: `${Date.now()}-${index}`,
       visited: index === 0,
       marked: false,
       selectedOption: undefined,
@@ -517,8 +1444,8 @@ function App() {
     setSecondsLeft(settings.untimed ? 0 : settings.timerMinutes * 60);
     setWarning("");
     submittedRef.current = false;
-    examInitializedRef.current = true;
-    setView("exam");
+    examInitializedRef.current = false;
+    await createAttemptAndEnter(retry, activeAttemptMockTestIdRef.current ?? currentMockId);
   };
 
   const currentQuestion = questions[activeIndex];
@@ -535,7 +1462,7 @@ function App() {
         <div className="exam-shell">
           <header className="exam-header">
             <div className="brand-lockup exam-brand"><div className="brand-mark"><Layers3 size={19} /></div><span>MockForge</span></div>
-            <div className="exam-title"><span>{settings.sectionName || (settings.tier === "Tier 1" ? `${settings.examName}: ${settings.selectedSubjects.join(", ")}` : settings.subject)}</span><b>{settings.tier} <i>•</i> +{settings.positiveMarks} / -{settings.negativeMarks}</b></div>
+            <div className="exam-title"><span>{settings.sectionName || (settings.tier === "Tier 1" ? `${settings.examName}: ${settings.selectedSubjects.join(", ")}` : settings.subject)}</span><b>{untrackedPractice ? "Untracked Practice" : settings.tier} <i>•</i> +{settings.positiveMarks} / -{settings.negativeMarks}</b></div>
             <div className="header-right">
               <span className="scheme-pill"><Check size={14} /> Correct: +{settings.positiveMarks} <span>·</span> Wrong: -{settings.negativeMarks}</span>
               <ThemeToggle theme={theme} onToggle={toggleTheme} />
@@ -686,7 +1613,7 @@ function App() {
             <div className="ready-test-title">
               <span className="ready-file-icon"><FileText size={22} /></span>
               <div><span className="section-kicker">YOUR MOCK TEST</span><h2 id="ready-test-name">{settings.sectionName || settings.subject}</h2></div>
-              <span className="ready-tier">{settings.tier}</span>
+              <span className="ready-tier">{untrackedPractice ? "Untracked Practice" : settings.tier}</span>
             </div>
             {warning && <div className="setup-warning"><CircleHelp size={17} /><span>{warning}</span><button onClick={() => setWarning("")} aria-label="Dismiss warning"><X size={15} /></button></div>}
             <div className="ready-details">
@@ -700,7 +1627,11 @@ function App() {
             <div className="ready-note"><Clock3 size={16} /><span>The exam timer and question timing start when you begin the mock.</span></div>
             <div className="ready-actions">
               <button className="btn btn-light" onClick={() => setView("setup")}><ArrowLeft size={16} />Back to Setup</button>
-              <button className="btn btn-primary" onClick={startExam} disabled={questions.length === 0 || examInitializedRef.current}>Start Mock Test<ArrowRight size={16} /></button>
+              <button className="btn btn-light" onClick={() => void openLibrary()}><History size={16} />Saved Mocks</button>
+              <button className="btn btn-primary" onClick={() => void startExam()} disabled={questions.length === 0 || examInitializedRef.current || startingAttempt}>
+                {startingAttempt ? "Creating attempt..." : untrackedPractice ? "Start Untracked Practice" : "Start Mock Test"}
+                <ArrowRight size={16} />
+              </button>
             </div>
           </section>
         </main>
@@ -721,11 +1652,61 @@ function App() {
     />;
   }
 
+  if (view === "library") {
+    return (
+      <div className="app-shell">
+        <header className="site-header">
+          <a className="brand-lockup" href="#" onClick={(event) => event.preventDefault()}><div className="brand-mark"><Layers3 size={19} /></div><span>MockForge</span></a>
+          <nav className="header-nav"><span><BookOpen size={15} /> PYQ Mock Test Studio</span><button className="api-settings" onClick={() => void openLibrary()}><History size={15} />Saved Mocks</button><ThemeToggle theme={theme} onToggle={toggleTheme} /><button className="api-settings" onClick={() => setApiModal(true)}><KeyRound size={15} /> API Settings</button></nav>
+        </header>
+        <main className="library-main">
+          <div className="library-heading">
+            <div><div className="section-kicker">SAVED MOCKS</div><h1>Your mock library</h1><p>Open a saved mock and start whenever you are ready.</p></div>
+            <button className="btn btn-light" onClick={() => setView("setup")}><ArrowLeft size={16} />Back to Setup</button>
+          </div>
+          {storageWarning && <div className="setup-warning"><CircleHelp size={17} /><span>{storageWarning}</span><button onClick={() => setStorageWarning("")} aria-label="Dismiss warning"><X size={15} /></button></div>}
+          {libraryLoading ? (
+            <div className="library-empty"><LoaderCircle size={19} className="spin" /><span>Loading saved mocks...</span></div>
+          ) : savedMocks.length === 0 ? (
+            <div className="library-empty"><History size={20} /><span><strong>No saved mocks yet</strong><small>Generate a mock to add it to this library.</small></span></div>
+          ) : (
+            <div className="library-grid">
+              {savedMocks.map((mock) => (
+                <article className="library-card" key={mock.id}>
+                  <div className="library-card-top">
+                    <span className="library-tier">{mock.exam.examName} · {mock.exam.tier}</span>
+                    <span className="library-status">{completedAttemptCounts[mock.id] ? "Attempted" : "Never attempted"}</span>
+                    {latestAttemptDates[mock.id] && (
+                      <span className="library-status">{completedAttemptCounts[mock.id]} completed · Latest {new Date(latestAttemptDates[mock.id]).toLocaleDateString()}</span>
+                    )}
+                  </div>
+                  <h2>{mock.name}</h2>
+                  <div className="library-meta">
+                    <span><FileText size={14} />{mock.questions.length} questions</span>
+                    <span><Clock3 size={14} />{mock.exam.untimed ? "Untimed" : `${mock.exam.timerMinutes} minutes`}</span>
+                  </div>
+                  <div className="library-card-footer">
+                    <span>{new Date(mock.createdAt).toLocaleDateString()}</span>
+                    <div className="library-card-actions">
+                      <button type="button" className="btn btn-light" onClick={() => void renameMock(mock)}>Rename</button>
+                      <button type="button" className="btn btn-outline" onClick={() => void deleteMockRecord(mock)}>Delete</button>
+                      <button className="btn btn-primary" onClick={() => void openSavedMock(mock.id)}>Open<ArrowRight size={15} /></button>
+                    </div>
+                  </div>
+                </article>
+              ))}
+            </div>
+          )}
+        </main>
+      </div>
+    );
+  }
+
   return (
     <div className="app-shell">
       <header className="site-header">
         <a className="brand-lockup" href="#" onClick={(event) => event.preventDefault()}><div className="brand-mark"><Layers3 size={19} /></div><span>MockForge</span></a>
-        <nav className="header-nav"><span><BookOpen size={15} /> PYQ Mock Test Studio</span><ThemeToggle theme={theme} onToggle={toggleTheme} /><button className="api-settings" onClick={() => setApiModal(true)}><KeyRound size={15} /> API Settings</button></nav>
+        <nav className="header-nav"><span><BookOpen size={15} /> PYQ Mock Test Studio</span><button className="api-settings" onClick={() => void openLibrary()}><History size={15} />Saved Mocks</button><ThemeToggle theme={theme} onToggle={toggleTheme} /><button className="api-settings" onClick={() => setApiModal(true)}><KeyRound size={15} /> API Settings</button></nav>
       </header>
       <main className="home-main">
         <section className="hero-section">
@@ -749,6 +1730,52 @@ function App() {
           </div>
         </section>
 
+        {migrationStatus !== "idle" && migrationStatus !== "complete" && (
+          <div className="migration-status" role="status">
+            <CircleHelp size={16} />
+            <span>{migrationStatus === "running" ? "Migrating legacy attempt history..." : "Legacy attempt history migration needs attention."}</span>
+          </div>
+        )}
+
+        {savedPdfs.length > 0 && (
+          <section className="pdf-library-section" aria-labelledby="saved-pdfs-title">
+            <div className="pdf-library-heading"><div><div className="section-kicker">LOCAL PDFs</div><h2 id="saved-pdfs-title">Saved PDFs</h2></div><span>{savedPdfs.length}</span></div>
+            <div className="pdf-library-list">
+              {savedPdfs.map((pdf) => (
+                <article className="pdf-library-row" key={pdf.id}>
+                  <span className="pdf-library-icon"><FileText size={16} /></span>
+                  <div className="pdf-library-meta"><strong>{pdf.filename}</strong><small>{pdf.pageCount} pages · Added {new Date(pdf.createdAt).toLocaleDateString()} · {(pdf.size / 1024 / 1024).toFixed(2)} MB</small></div>
+                  <div className="pdf-library-actions"><button type="button" className="btn btn-light" onClick={() => void renamePdf(pdf)}>Rename</button><button type="button" className="btn btn-outline" onClick={() => void deletePdfRecord(pdf)}>Delete</button></div>
+                </article>
+              ))}
+            </div>
+          </section>
+        )}
+
+        {unfinishedAttempts.length > 0 && (
+          <section className="recovery-section" aria-labelledby="unfinished-attempts-title">
+            <div className="recovery-heading">
+              <div><div className="section-kicker">RECOVER PRACTICE</div><h2 id="unfinished-attempts-title">Unfinished attempts</h2></div>
+              <span>{unfinishedAttempts.length}</span>
+            </div>
+            <div className="recovery-list">
+              {unfinishedAttempts.map((attempt) => (
+                <article className="recovery-card" key={attempt.id}>
+                  <div className="recovery-meta">
+                    <strong>{attempt.mockName || attempt.exam?.sectionName || attempt.exam?.subject || "Saved mock attempt"}</strong>
+                    <small>{attempt.exam ? `${attempt.exam.examName || "Exam"} · ${attempt.exam.tier} · ${attempt.exam.untimed ? "Untimed" : `${attempt.remainingSeconds}s remaining`}` : "Attempt snapshot"}</small>
+                    <span>Last saved {new Date(attempt.updatedAt).toLocaleString()}</span>
+                  </div>
+                  <div className="recovery-actions">
+                    <button type="button" className="btn btn-light" onClick={() => void discardUnfinishedAttempt(attempt.id)}>Discard</button>
+                    <button type="button" className="btn btn-primary" onClick={() => void resumeUnfinishedAttempt(attempt)}>Resume<ArrowRight size={15} /></button>
+                  </div>
+                </article>
+              ))}
+            </div>
+          </section>
+        )}
+
         <section className="setup-layout">
           <div className="setup-card">
             <div className="card-heading">
@@ -771,9 +1798,16 @@ function App() {
                 <strong>{file ? file.name : "Drop your response sheet here"}</strong>
                 <span>{file ? `${pageCount} pages detected · Click to replace PDF` : "or browse files · PDF format, up to 50 MB"}</span>
               </div>
-              {file && <span className="pdf-chip"><FileText size={13} /> PDF</span>}
+              {file && <span className="pdf-chip" title={savedPdfId ? "Saved locally" : "Local save pending"}><FileText size={13} /> PDF</span>}
               {!file && <button className="browse-btn" type="button">Browse files</button>}
             </div>
+            {storageWarning && (
+              <div className="setup-warning">
+                <CircleHelp size={17} />
+                <span>{storageWarning}</span>
+                <button onClick={() => setStorageWarning("")} aria-label="Dismiss local storage warning"><X size={15} /></button>
+              </div>
+            )}
 
             <div className="form-section">
               <div className="form-section-title"><span className="step-number">1</span><div><strong>Choose your exam preset</strong><small>We’ll set the marking scheme and timer for you.</small></div></div>
@@ -888,8 +1922,8 @@ function App() {
           ) : (
             <div className="history-list">{attempts.slice(0, 4).map((attempt) => {
               const score = getScore(attempt);
-            return <button className="history-row" key={attempt.id} onClick={() => { setCurrentAttempt(attempt); setReviewFilter("All"); setStorageWarning(""); setView("results"); setSettings((current) => ({ ...current, tier: attempt.tier, positiveMarks: attempt.positiveMarks, negativeMarks: attempt.negativeMarks, sectionName: attempt.sectionName, expectedQuestions: attempt.questions.length })); }}>
-                <span className="history-file"><FileText size={17} /></span><span className="history-meta"><strong>{attempt.sectionName}</strong><small>{attempt.tier} · {new Date(attempt.completedAt).toLocaleDateString()} · {attempt.questions.length} questions</small></span><span className="history-score"><b>{score.net.toFixed(2)}</b><small>score</small></span><ArrowRight size={17} />
+            return <button className="history-row" key={attempt.id ? attempt.id : `untracked-${attempt.completedAt}`} onClick={() => { setCurrentAttempt(attempt); setReviewFilter("All"); setStorageWarning(""); setView("results"); setSettings((current) => ({ ...current, tier: attempt.tier, positiveMarks: attempt.positiveMarks, negativeMarks: attempt.negativeMarks, sectionName: attempt.sectionName, expectedQuestions: attempt.questions.length })); }}>
+                <span className="history-file"><FileText size={17} /></span><span className="history-meta"><strong>{attempt.sectionName}</strong><small>{attempt.untracked ? "Untracked practice" : attempt.tier} · {new Date(attempt.completedAt).toLocaleDateString()} · {attempt.questions.length} questions</small></span><span className="history-score"><b>{score.net.toFixed(2)}</b><small>score</small></span><ArrowRight size={17} />
               </button>;
             })}</div>
           )}
@@ -988,7 +2022,7 @@ function Results({ attempt, filter, setFilter, storageWarning, theme, onToggleTh
       </header>
       <main className="results-main">
         {storageWarning && <div className="error-banner results-storage-warning"><CircleHelp size={17} /><span>{storageWarning}</span></div>}
-        <div className="results-intro"><div className="eyebrow"><span className="eyebrow-dot" /> SECTION COMPLETE</div><h1>Your practice, <span>decoded.</span></h1><p>{attempt.sectionName} <i>·</i> {new Date(attempt.completedAt).toLocaleString()}</p></div>
+        <div className="results-intro"><div className="eyebrow"><span className="eyebrow-dot" /> {attempt.untracked ? "UNTRACKED PRACTICE" : "SECTION COMPLETE"}</div><h1>Your practice, <span>decoded.</span></h1><p>{attempt.untracked && <><strong>Not saved to attempt history</strong> <i>·</i> </>}{attempt.sectionName} <i>·</i> {new Date(attempt.completedAt).toLocaleString()}</p></div>
         <div className="score-grid">
           <div className="score-card score-primary"><div className="score-card-label"><BarChart3 size={16} /> NET SCORE</div><div className="score-large">{score.net.toFixed(2)}<span> / {score.max.toFixed(2)}</span></div><div className="score-note">{attempt.tier} <i>·</i> +{attempt.positiveMarks} / −{attempt.negativeMarks}</div><div className="score-progress"><span style={{ width: `${score.max ? Math.max(0, Math.min(100, (score.net / score.max) * 100)) : 0}%` }} /></div></div>
           <Metric label="Positive marks" value={`+${score.positiveEarned.toFixed(2)}`} detail={`${score.correct} correct`} icon={<CheckCircle2 size={16} />} tone="green" />
