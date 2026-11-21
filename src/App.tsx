@@ -2,7 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import type { ChangeEvent, DragEvent, ReactNode } from "react";
 import {
   ArrowLeft, ArrowRight, BarChart3, BookOpen, Check, CheckCircle2, ChevronDown,
-  CircleHelp, Clock3, Eye, EyeOff, FileText, History, KeyRound, Layers3, LoaderCircle, LockKeyhole,
+  CircleHelp, Clock3, FileText, History, KeyRound, Layers3, LoaderCircle, LockKeyhole,
   Menu, Moon, RotateCcw, Settings2, ShieldCheck, Sparkles, Sun, Upload, X, ZoomIn, ZoomOut,
 } from "lucide-react";
 import DOMPurify from "dompurify";
@@ -34,7 +34,6 @@ type Question = {
 type ExamSettings = {
   tier: Tier;
   subject: string;
-  tier1Subjects: Tier1Subject[];
   expectedQuestions: number;
   positiveMarks: number;
   negativeMarks: number;
@@ -58,30 +57,12 @@ type ExtractedQuestion = {
   correctOptionIndex: number;
   passageText?: string;
 };
-type GeminiConnectionStatus =
-  | "idle"
-  | "testing"
-  | "connected"
-  | "invalid_key"
-  | "quota"
-  | "network"
-  | "timeout"
-  | "api_error"
-  | "cleared";
 
 const HISTORY_KEY = "mockforge.attempts";
 const THEME_KEY = "mockforge.theme";
-const GEMINI_CONNECTION_TEST_TIMEOUT_MS = 180_000;
 const MIN_QUESTION_ZOOM = 70;
 const MAX_QUESTION_ZOOM = 150;
 const QUESTION_ZOOM_STEP = 10;
-const TIER1_SUBJECTS = [
-  "General Intelligence & Reasoning",
-  "General Awareness",
-  "Quantitative Aptitude",
-  "English Comprehension",
-] as const;
-type Tier1Subject = typeof TIER1_SUBJECTS[number];
 const SUBJECTS = [
   { name: "Mathematical Abilities", questions: 30, minutes: 35 },
   { name: "Reasoning & General Intelligence", questions: 30, minutes: 25 },
@@ -93,7 +74,6 @@ const SUBJECTS = [
 const initialSettings: ExamSettings = {
   tier: "Tier 1",
   subject: SUBJECTS[0].name,
-  tier1Subjects: [...TIER1_SUBJECTS],
   expectedQuestions: 25,
   positiveMarks: 2,
   negativeMarks: 0.5,
@@ -183,10 +163,6 @@ function App() {
   const [secondsLeft, setSecondsLeft] = useState(0);
   const [elapsedSeconds, setElapsedSeconds] = useState(0);
   const [apiModal, setApiModal] = useState(false);
-  const [geminiApiKey, setGeminiApiKey] = useState("");
-  const [showGeminiApiKey, setShowGeminiApiKey] = useState(false);
-  const [geminiConnectionStatus, setGeminiConnectionStatus] = useState<GeminiConnectionStatus>("idle");
-  const geminiTestControllerRef = useRef<AbortController | null>(null);
   const [submitModal, setSubmitModal] = useState(false);
   const [attempts, setAttempts] = useState<Attempt[]>(readAttempts);
   const [currentAttempt, setCurrentAttempt] = useState<Attempt | null>(null);
@@ -199,56 +175,6 @@ function App() {
   const extractionControllerRef = useRef<AbortController | null>(null);
   const pdfInputRef = useRef<HTMLInputElement>(null);
   const examInitializedRef = useRef(false);
-  const testGeminiConnection = async () => {
-    const apiKey = geminiApiKey.trim();
-    if (!apiKey) {
-      setGeminiConnectionStatus("invalid_key");
-      return;
-    }
-    const localDevelopmentHosts = ["localhost", "127.0.0.1", "::1", "[::1]"];
-    if (window.location.protocol !== "https:" && !localDevelopmentHosts.includes(window.location.hostname)) {
-      setGeminiConnectionStatus("api_error");
-      return;
-    }
-
-    const controller = new AbortController();
-    geminiTestControllerRef.current = controller;
-    setGeminiConnectionStatus("testing");
-    let timedOut = false;
-    const timeout = setTimeout(() => {
-      timedOut = true;
-      controller.abort();
-    }, GEMINI_CONNECTION_TEST_TIMEOUT_MS);
-    try {
-      const response = await fetch("/api/ai/test-gemini", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ apiKey }),
-        signal: controller.signal,
-      });
-      if (!response.ok) {
-        setGeminiConnectionStatus("api_error");
-        return;
-      }
-      const result: unknown = await response.json().catch(() => undefined);
-      const resultStatus = result && typeof result === "object" && "status" in result
-        ? result.status
-        : undefined;
-      const knownStatuses: Exclude<GeminiConnectionStatus, "idle" | "testing" | "cleared">[] = [
-        "connected", "invalid_key", "quota", "network", "timeout", "api_error",
-      ];
-      setGeminiConnectionStatus(knownStatuses.find((status) => status === resultStatus) ?? "api_error");
-    } catch {
-      if (timedOut) {
-        setGeminiConnectionStatus("timeout");
-      } else if (!controller.signal.aborted) {
-        setGeminiConnectionStatus("network");
-      }
-    } finally {
-      clearTimeout(timeout);
-      if (geminiTestControllerRef.current === controller) geminiTestControllerRef.current = null;
-    }
-  };
 
   useEffect(() => {
     document.documentElement.dataset.theme = theme;
@@ -261,19 +187,6 @@ function App() {
 
   const toggleTheme = () => setTheme((current) => current === "dark" ? "light" : "dark");
   const patchSettings = (patch: Partial<ExamSettings>) => setSettings((current) => ({ ...current, ...patch }));
-  const selectedSubjectNames = settings.tier === "Tier 1"
-    ? TIER1_SUBJECTS.filter((subject) => settings.tier1Subjects.includes(subject))
-    : [settings.subject];
-  const selectedSubjectLabel = selectedSubjectNames.join(", ");
-  const activeSectionName = settings.sectionName || selectedSubjectLabel;
-  const toggleTier1Subject = (subject: Tier1Subject) => {
-    setSettings((current) => ({
-      ...current,
-      tier1Subjects: current.tier1Subjects.includes(subject)
-        ? current.tier1Subjects.filter((selected) => selected !== subject)
-        : [...current.tier1Subjects, subject],
-    }));
-  };
   const startExam = () => {
     if (view !== "ready" || questions.length === 0 || examInitializedRef.current) return;
     examInitializedRef.current = true;
@@ -349,10 +262,7 @@ function App() {
     images: { page: number; data: string }[],
     signal: AbortSignal,
   ): Promise<ExtractedQuestion[]> => {
-    const sectionInstruction = settings.tier === "Tier 1"
-      ? `Only include questions from these selected Tier 1 subjects/modules: ${selectedSubjectNames.join(", ")}. Preserve their order and distribution from the provided pages; do not rebalance or invent questions.${settings.sectionName.trim() ? ` Restrict them to the section "${settings.sectionName.trim()}".` : ""}`
-      : `Only include questions belonging to section "${settings.sectionName || settings.subject}" from the provided pages.`;
-    const prompt = `You are extracting questions from an SSC competitive exam candidate response sheet. ${sectionInstruction} Skip ads and promotional pages. Return ONLY valid JSON matching {"questions":[{"questionText":"...","options":["...","...","...","..."],"correctOptionIndex":1,"passageText":"..."}]}. correctOptionIndex is 1, 2, 3, or 4 based on the green official correct-answer tick (not the candidate's chosen answer). Scrub every checkmark, red cross, Question ID, Option ID, Status, Chosen Option, Adda247 and Google Play artifact from question/option text. Keep question and options clean. Express math in LaTeX with $...$ inline and $$...$$ display; preserve structured frequency tables as Markdown tables. Wrap any underlined English text in <u>...</u>. Attach the exact same passageText to every sub-question sharing a comprehension/cloze passage. Each question must have exactly four options. Do not invent missing content.`;
+    const prompt = `You are extracting questions from an SSC competitive exam candidate response sheet. Only include questions belonging to section "${settings.sectionName || settings.subject}" from the provided pages. Skip ads and promotional pages. Return ONLY valid JSON matching {"questions":[{"questionText":"...","options":["...","...","...","..."],"correctOptionIndex":1,"passageText":"..."}]}. correctOptionIndex is 1, 2, 3, or 4 based on the green official correct-answer tick (not the candidate's chosen answer). Scrub every checkmark, red cross, Question ID, Option ID, Status, Chosen Option, Adda247 and Google Play artifact from question/option text. Keep question and options clean. Express math in LaTeX with $...$ inline and $$...$$ display; preserve structured frequency tables as Markdown tables. Wrap any underlined English text in <u>...</u>. Attach the exact same passageText to every sub-question sharing a comprehension/cloze passage. Each question must have exactly four options. Do not invent missing content.`;
     let response: Response;
     try {
       response = await fetch("/api/ai/extract", {
@@ -401,10 +311,6 @@ function App() {
 
   const generateMock = async () => {
     if (extractionInFlightRef.current) return;
-    if (settings.tier === "Tier 1" && selectedSubjectNames.length === 0) {
-      setError("Select at least one Tier 1 subject to generate a mock.");
-      return;
-    }
     if (!file) {
       setError("Upload a candidate response sheet PDF to continue.");
       return;
@@ -474,19 +380,8 @@ function App() {
   };
 
   useEffect(() => {
-    const clearSessionKey = () => {
-      geminiTestControllerRef.current?.abort();
-      geminiTestControllerRef.current = null;
-      setGeminiApiKey("");
-      setShowGeminiApiKey(false);
-      setGeminiConnectionStatus("idle");
-    };
-    window.addEventListener("pagehide", clearSessionKey);
-    return () => {
-      window.removeEventListener("pagehide", clearSessionKey);
-      geminiTestControllerRef.current?.abort();
-      extractionControllerRef.current?.abort();
-    };
+    localStorage.removeItem("mockforge.gemini-api-key");
+    return () => extractionControllerRef.current?.abort();
   }, []);
 
   const finishAttempt = useCallback(() => {
@@ -495,7 +390,7 @@ function App() {
     const attempt: Attempt = {
       id: `${Date.now()}`,
       completedAt: new Date().toISOString(),
-      sectionName: activeSectionName,
+      sectionName: settings.sectionName || settings.subject,
       tier: settings.tier,
       positiveMarks: settings.positiveMarks,
       negativeMarks: settings.negativeMarks,
@@ -602,7 +497,7 @@ function App() {
         <div className="exam-shell">
           <header className="exam-header">
             <div className="brand-lockup exam-brand"><div className="brand-mark"><Layers3 size={19} /></div><span>MockForge</span></div>
-            <div className="exam-title"><span>{activeSectionName}</span><b>{settings.tier} <i>•</i> +{settings.positiveMarks} / -{settings.negativeMarks}</b></div>
+            <div className="exam-title"><span>{settings.sectionName || settings.subject}</span><b>{settings.tier} <i>•</i> +{settings.positiveMarks} / -{settings.negativeMarks}</b></div>
             <div className="header-right">
               <span className="scheme-pill"><Check size={14} /> Correct: +{settings.positiveMarks} <span>·</span> Wrong: -{settings.negativeMarks}</span>
               <ThemeToggle theme={theme} onToggle={toggleTheme} />
@@ -613,7 +508,7 @@ function App() {
           <main className="exam-layout">
             <section className="question-workspace">
               <div className="workspace-topline">
-                <span className="workspace-section-name">SECTION: {activeSectionName}</span>
+                <span className="workspace-section-name">SECTION: {settings.sectionName || settings.subject}</span>
                 <div className="workspace-toolbar">
                   <span className="workspace-question-count">{questions.length} QUESTIONS</span>
                   <div className="question-zoom-controls" role="group" aria-label="Question display zoom">
@@ -753,12 +648,12 @@ function App() {
           <section className="ready-card" aria-labelledby="ready-test-name">
             <div className="ready-test-title">
               <span className="ready-file-icon"><FileText size={22} /></span>
-              <div><span className="section-kicker">YOUR MOCK TEST</span><h2 id="ready-test-name">{activeSectionName}</h2></div>
+              <div><span className="section-kicker">YOUR MOCK TEST</span><h2 id="ready-test-name">{settings.sectionName || settings.subject}</h2></div>
               <span className="ready-tier">{settings.tier}</span>
             </div>
             {warning && <div className="setup-warning"><CircleHelp size={17} /><span>{warning}</span><button onClick={() => setWarning("")} aria-label="Dismiss warning"><X size={15} /></button></div>}
             <div className="ready-details">
-              <div className="ready-detail"><span>Subject</span><strong>{selectedSubjectLabel}</strong></div>
+              <div className="ready-detail"><span>Subject</span><strong>{settings.subject}</strong></div>
               <div className="ready-detail"><span>Questions extracted</span><strong>{questions.length}</strong></div>
               <div className="ready-detail"><span>Expected questions</span><strong>{settings.expectedQuestions}</strong></div>
               <div className="ready-detail"><span>Duration</span><strong>{settings.untimed ? "Untimed practice" : `${settings.timerMinutes} minutes`}</strong></div>
@@ -854,31 +749,6 @@ function App() {
                   </button>
                 ))}
               </div>
-              {settings.tier === "Tier 1" && (
-                <fieldset className="tier1-subjects">
-                  <legend>Subjects / modules</legend>
-                  <div className="tier1-subject-options">
-                    {TIER1_SUBJECTS.map((subject) => {
-                      const selected = settings.tier1Subjects.includes(subject);
-                      return (
-                        <label className={`tier1-subject-option ${selected ? "tier1-subject-selected" : ""}`} key={subject}>
-                          <input
-                            type="checkbox"
-                            checked={selected}
-                            onChange={() => toggleTier1Subject(subject)}
-                          />
-                          <span>{subject}</span>
-                        </label>
-                      );
-                    })}
-                  </div>
-                  <small className="tier1-subject-count">
-                    {selectedSubjectNames.length === 0
-                      ? "Select at least one subject to generate a mock."
-                      : `${selectedSubjectNames.length} of ${TIER1_SUBJECTS.length} subjects selected`}
-                  </small>
-                </fieldset>
-              )}
               {settings.tier === "Tier 2" && (
                 <label className="field-label subject-field">Subject module
                   <span className="select-wrap"><select value={settings.subject} onChange={(event) => applySubject(event.target.value)}>{SUBJECTS.map((subject) => <option key={subject.name}>{subject.name}</option>)}</select><ChevronDown size={16} /></span>
@@ -918,8 +788,7 @@ function App() {
             {warning && <div className="setup-warning"><CircleHelp size={17} /><span>{warning}</span><button onClick={() => setWarning("")} aria-label="Dismiss warning"><X size={15} /></button></div>}
             {error && <div className="error-banner"><CircleHelp size={17} /><span>{error}</span><button onClick={() => setError("")} aria-label="Dismiss error"><X size={15} /></button></div>}
             {busy && <div className="progress-banner"><LoaderCircle size={17} className="spin" /><span>{progress}</span><button className="cancel-extraction" onClick={() => extractionControllerRef.current?.abort()}>Cancel</button></div>}
-            {busy && <div className="generation-time-notice">This may take approximately 5–10 minutes depending on the PDF size and number of pages. Please keep this tab open while your questions are being processed.</div>}
-            <button className="generate-btn" disabled={busy || !file || (settings.tier === "Tier 1" && selectedSubjectNames.length === 0)} onClick={() => void generateMock()}>
+            <button className="generate-btn" disabled={busy || !file} onClick={() => void generateMock()}>
               {busy ? <><LoaderCircle size={17} className="spin" /> Building your mock...</> : <>Generate section mock <ArrowRight size={17} /></>}
             </button>
             <div className="privacy-note"><LockKeyhole size={13} />Selected pages only · Your response sheet stays private</div>
@@ -954,66 +823,10 @@ function App() {
         </section>
         <footer className="site-footer"><span>MockForge <i>·</i> Built for better practice</span><span><LockKeyhole size={12} /> Your attempts are saved on this device</span></footer>
       </main>
-      {apiModal && <Modal title="Google Gemini API settings" onClose={() => setApiModal(false)}>
-        <p className="modal-copy">Add a Gemini key to test its connection. The key stays in this page’s memory, is cleared when the page session ends, and is not saved to your browser. This key is only used for the connection test; PDF extraction continues using the server’s existing environment configuration.</p>
-        <section className="gemini-settings" aria-label="Google Gemini configuration">
-          <div className="provider-heading"><span className="provider-mark">G</span><div><strong>Google Gemini</strong><small>Bring your own API key</small></div></div>
-          <label className="field-label key-field">API key
-            <span className="api-key-control">
-              <input
-                type={showGeminiApiKey ? "text" : "password"}
-                autoComplete="off"
-                spellCheck={false}
-                value={geminiApiKey}
-                onChange={(event) => {
-                  geminiTestControllerRef.current?.abort();
-                  geminiTestControllerRef.current = null;
-                  setGeminiApiKey(event.target.value);
-                  setGeminiConnectionStatus("idle");
-                }}
-                placeholder="Paste your Gemini API key"
-                aria-label="Google Gemini API key"
-              />
-              <button
-                className="key-visibility"
-                type="button"
-                onClick={() => setShowGeminiApiKey((current) => !current)}
-                aria-label={showGeminiApiKey ? "Hide API key" : "Show API key"}
-              >{showGeminiApiKey ? <EyeOff size={16} /> : <Eye size={16} />}</button>
-            </span>
-          </label>
-          <a className="gemini-key-link" href="https://aistudio.google.com/app/apikey" target="_blank" rel="noreferrer">
-            Get an API key from Google AI Studio <ArrowRight size={13} />
-          </a>
-          <div className={`connection-status connection-${geminiConnectionStatus}`} role="status" aria-live="polite">
-            <span className="connection-dot" />
-            {geminiConnectionStatus === "idle" && "Not tested"}
-            {geminiConnectionStatus === "testing" && <><LoaderCircle size={14} className="spin" /> Testing connection...</>}
-            {geminiConnectionStatus === "connected" && "Connection successful. The API key is valid."}
-            {geminiConnectionStatus === "invalid_key" && (geminiApiKey.trim() ? "Google rejected this API key. Check that it is correct and active." : "Enter an API key to test the connection.")}
-            {geminiConnectionStatus === "quota" && "The key is valid, but its Gemini quota or rate limit has been reached."}
-            {geminiConnectionStatus === "network" && "Could not reach Google Gemini. Check your network connection and try again."}
-            {geminiConnectionStatus === "timeout" && "The connection test timed out. Try again in a moment."}
-            {geminiConnectionStatus === "api_error" && (window.location.protocol !== "https:" && !["localhost", "127.0.0.1", "::1", "[::1]"].includes(window.location.hostname)
-              ? "Use a secure HTTPS connection to test your API key."
-              : "Google Gemini could not complete the connection test. Check the key's API access and try again.")}
-            {geminiConnectionStatus === "cleared" && "API key cleared from this session."}
-          </div>
-          <div className="gemini-actions">
-            <button className="btn btn-outline" type="button" disabled={!geminiApiKey} onClick={() => {
-              geminiTestControllerRef.current?.abort();
-              geminiTestControllerRef.current = null;
-              setGeminiApiKey("");
-              setShowGeminiApiKey(false);
-              setGeminiConnectionStatus("cleared");
-            }}>Clear API Key</button>
-            <button className="btn btn-primary" type="button" disabled={geminiConnectionStatus === "testing"} onClick={() => void testGeminiConnection()}>
-              {geminiConnectionStatus === "testing" ? <><LoaderCircle size={14} className="spin" /> Testing...</> : "Test Connection"}
-            </button>
-          </div>
-        </section>
-        <div className="key-hint"><KeyRound size={14} /><span>The key is sent to this app’s server using HTTPS (localhost is allowed for development) and is never included in the URL or returned by the server.</span></div>
-        <div className="modal-actions"><button className="btn btn-light" onClick={() => setApiModal(false)}>Done</button></div>
+      {apiModal && <Modal title="Server AI settings" onClose={() => setApiModal(false)}>
+        <p className="modal-copy">PDF pages are sent to this app’s server for extraction. Gemini and Lovable AI credentials stay in server environment variables and are never sent to the browser.</p>
+        <div className="key-hint"><KeyRound size={14} /><span>Configure <code>GEMINI_API_KEY</code> and <code>GEMINI_MODEL</code> in the server .env. <code>LOVABLE_API_KEY</code> enables the server-side fallback.</span></div>
+        <div className="modal-actions"><button className="btn btn-primary" onClick={() => setApiModal(false)}>Done</button></div>
       </Modal>}
     </div>
   );
