@@ -396,8 +396,8 @@ button:disabled { cursor: not-allowed; opacity: .48; }
 @keyframes connection-pulse { to { opacity: .35; } }
 .connection-connected { color: #23845f; }
 .connection-connected .connection-dot { background: #23996d; }
-.connection-invalid_key, .connection-quota, .connection-network, .connection-timeout, .connection-api_error, .connection-server_error { color: #b34e55; }
-.connection-invalid_key .connection-dot, .connection-quota .connection-dot, .connection-network .connection-dot, .connection-timeout .connection-dot, .connection-api_error .connection-dot, .connection-server_error .connection-dot { background: #c65a62; }
+.connection-invalid_key, .connection-quota, .connection-network, .connection-timeout, .connection-api_error { color: #b34e55; }
+.connection-invalid_key .connection-dot, .connection-quota .connection-dot, .connection-network .connection-dot, .connection-timeout .connection-dot, .connection-api_error .connection-dot { background: #c65a62; }
 .connection-cleared { color: #23845f; }
 .connection-cleared .connection-dot { background: #23996d; }
 .gemini-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 8px; }
@@ -927,8 +927,7 @@ button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible
 :root[data-theme="dark"] .connection-quota,
 :root[data-theme="dark"] .connection-network,
 :root[data-theme="dark"] .connection-timeout,
-:root[data-theme="dark"] .connection-api_error,
-:root[data-theme="dark"] .connection-server_error { color: #efa0a4; }
+:root[data-theme="dark"] .connection-api_error { color: #efa0a4; }
 :root[data-theme="dark"] .key-visibility { color: var(--text-secondary); }
 :root[data-theme="dark"] .key-visibility:hover { color: var(--text-primary); background: #2a3746; }
 :root[data-theme="dark"] .gemini-key-link { color: #9fc2f3; }

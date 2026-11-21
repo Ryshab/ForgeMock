@@ -67,8 +67,6 @@ type GeminiConnectionStatus =
   | "network"
   | "timeout"
   | "api_error"
-  | "server_error"
-  | "server_unreachable"
   | "cleared";
 
 const HISTORY_KEY = "mockforge.attempts";
@@ -214,11 +212,6 @@ function App() {
 
     const controller = new AbortController();
     geminiTestControllerRef.current = controller;
-    let timedOut = false;
-    const timeout = setTimeout(() => {
-      timedOut = true;
-      controller.abort();
-    }, 180_000);
     setGeminiConnectionStatus("testing");
     try {
       const response = await fetch("/api/ai/test-gemini", {
@@ -228,7 +221,7 @@ function App() {
         signal: controller.signal,
       });
       if (!response.ok) {
-        setGeminiConnectionStatus(response.status >= 500 ? "server_error" : "api_error");
+        setGeminiConnectionStatus("api_error");
         return;
       }
       const result: unknown = await response.json().catch(() => undefined);
@@ -236,14 +229,12 @@ function App() {
         ? result.status
         : undefined;
       const knownStatuses: Exclude<GeminiConnectionStatus, "idle" | "testing" | "cleared">[] = [
-        "connected", "invalid_key", "quota", "network", "timeout", "api_error", "server_error", "server_unreachable",
+        "connected", "invalid_key", "quota", "network", "timeout", "api_error",
       ];
       setGeminiConnectionStatus(knownStatuses.find((status) => status === resultStatus) ?? "api_error");
     } catch {
-      if (timedOut) setGeminiConnectionStatus("timeout");
-      else if (!controller.signal.aborted) setGeminiConnectionStatus("server_unreachable");
+      if (!controller.signal.aborted) setGeminiConnectionStatus("network");
     } finally {
-      clearTimeout(timeout);
       if (geminiTestControllerRef.current === controller) geminiTestControllerRef.current = null;
     }
   };
@@ -351,25 +342,12 @@ function App() {
       ? `Only include questions from these selected Tier 1 subjects/modules: ${selectedSubjectNames.join(", ")}. Preserve their order and distribution from the provided pages; do not rebalance or invent questions.${settings.sectionName.trim() ? ` Restrict them to the section "${settings.sectionName.trim()}".` : ""}`
       : `Only include questions belonging to section "${settings.sectionName || settings.subject}" from the provided pages.`;
     const prompt = `You are extracting questions from an SSC competitive exam candidate response sheet. ${sectionInstruction} Skip ads and promotional pages. Return ONLY valid JSON matching {"questions":[{"questionText":"...","options":["...","...","...","..."],"correctOptionIndex":1,"passageText":"..."}]}. correctOptionIndex is 1, 2, 3, or 4 based on the green official correct-answer tick (not the candidate's chosen answer). Scrub every checkmark, red cross, Question ID, Option ID, Status, Chosen Option, Adda247 and Google Play artifact from question/option text. Keep question and options clean. Express math in LaTeX with $...$ inline and $$...$$ display; preserve structured frequency tables as Markdown tables. Wrap any underlined English text in <u>...</u>. Attach the exact same passageText to every sub-question sharing a comprehension/cloze passage. Each question must have exactly four options. Do not invent missing content.`;
-    const apiKey = geminiApiKey.trim();
-    const localDevelopmentHosts = ["localhost", "127.0.0.1", "::1", "[::1]"];
-    if (
-      apiKey &&
-      window.location.protocol !== "https:" &&
-      !localDevelopmentHosts.includes(window.location.hostname)
-    ) {
-      throw new Error("Use HTTPS to send your Gemini API key. Localhost is allowed for development.");
-    }
     let response: Response;
     try {
       response = await fetch("/api/ai/extract", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          prompt,
-          pages: images,
-          ...(apiKey ? { apiKey } : {}),
-        }),
+        body: JSON.stringify({ prompt, pages: images }),
         signal,
       });
     } catch (reason) {
@@ -966,7 +944,7 @@ function App() {
         <footer className="site-footer"><span>MockForge <i>·</i> Built for better practice</span><span><LockKeyhole size={12} /> Your attempts are saved on this device</span></footer>
       </main>
       {apiModal && <Modal title="Google Gemini API settings" onClose={() => setApiModal(false)}>
-        <p className="modal-copy">Add a Gemini key to test its connection and use it for PDF question extraction. The key stays in this page’s memory, is cleared when the page session ends, and is not saved to your browser.</p>
+        <p className="modal-copy">Add a Gemini key to test its connection. The key stays in this page’s memory, is cleared when the page session ends, and is not saved to your browser. This key is only used for the connection test; PDF extraction continues using the server’s existing environment configuration.</p>
         <section className="gemini-settings" aria-label="Google Gemini configuration">
           <div className="provider-heading"><span className="provider-mark">G</span><div><strong>Google Gemini</strong><small>Bring your own API key</small></div></div>
           <label className="field-label key-field">API key
@@ -1003,10 +981,8 @@ function App() {
             {geminiConnectionStatus === "connected" && "Connection successful. The API key is valid."}
             {geminiConnectionStatus === "invalid_key" && (geminiApiKey.trim() ? "Google rejected this API key. Check that it is correct and active." : "Enter an API key to test the connection.")}
             {geminiConnectionStatus === "quota" && "The key is valid, but its Gemini quota or rate limit has been reached."}
-            {geminiConnectionStatus === "network" && "The MockForge server could not reach Google Gemini. Check your internet connection."}
+            {geminiConnectionStatus === "network" && "Could not reach Google Gemini. Check your network connection and try again."}
             {geminiConnectionStatus === "timeout" && "The connection test timed out. Try again in a moment."}
-            {geminiConnectionStatus === "server_error" && "MockForge's server could not complete the connection test. Try again later."}
-            {geminiConnectionStatus === "server_unreachable" && "Could not reach the MockForge server. Check that the local server is running."}
             {geminiConnectionStatus === "api_error" && (window.location.protocol !== "https:" && !["localhost", "127.0.0.1", "::1", "[::1]"].includes(window.location.hostname)
               ? "Use a secure HTTPS connection to test your API key."
               : "Google Gemini could not complete the connection test. Check the key's API access and try again.")}
