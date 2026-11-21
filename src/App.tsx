@@ -18,6 +18,7 @@ async function loadPdfJs() {
 }
 
 type Tier = "Tier 1" | "Tier 2";
+type ExamName = "SSC CGL" | "SSC CHSL";
 type Theme = "dark" | "light";
 type QuestionStatus = "not-visited" | "not-answered" | "answered" | "marked" | "answered-marked";
 type Question = {
@@ -33,7 +34,9 @@ type Question = {
 };
 type ExamSettings = {
   tier: Tier;
+  examName: ExamName;
   subject: string;
+  selectedSubjects: string[];
   expectedQuestions: number;
   positiveMarks: number;
   negativeMarks: number;
@@ -70,14 +73,22 @@ const SUBJECTS = [
   { name: "General Awareness", questions: 25, minutes: 15 },
   { name: "Computer Knowledge Module", questions: 20, minutes: 15 },
 ];
+const TIER1_SUBJECTS = [
+  "General Intelligence & Reasoning",
+  "General Awareness",
+  "Quantitative Aptitude",
+  "English Comprehension",
+];
 
 const initialSettings: ExamSettings = {
   tier: "Tier 1",
+  examName: "SSC CGL",
   subject: SUBJECTS[0].name,
-  expectedQuestions: 25,
+  selectedSubjects: [...TIER1_SUBJECTS],
+  expectedQuestions: 100,
   positiveMarks: 2,
   negativeMarks: 0.5,
-  timerMinutes: 15,
+  timerMinutes: 60,
   untimed: false,
   sectionName: "",
 };
@@ -187,6 +198,10 @@ function App() {
 
   const toggleTheme = () => setTheme((current) => current === "dark" ? "light" : "dark");
   const patchSettings = (patch: Partial<ExamSettings>) => setSettings((current) => ({ ...current, ...patch }));
+  const getTier1Structure = (subjects: string[]) => ({
+    expectedQuestions: subjects.length * 25,
+    timerMinutes: subjects.length * 15,
+  });
   const startExam = () => {
     if (view !== "ready" || questions.length === 0 || examInitializedRef.current) return;
     examInitializedRef.current = true;
@@ -204,11 +219,28 @@ function App() {
   };
   const applyTier = (tier: Tier) => {
     if (tier === "Tier 1") {
-      patchSettings({ tier, expectedQuestions: 25, positiveMarks: 2, negativeMarks: 0.5, timerMinutes: 15 });
+      const structure = getTier1Structure(settings.selectedSubjects);
+      patchSettings({ tier, positiveMarks: 2, negativeMarks: 0.5, ...structure });
     } else {
       const subject = SUBJECTS.find((item) => item.name === settings.subject) ?? SUBJECTS[0];
       patchSettings({ tier, positiveMarks: 3, negativeMarks: 1, expectedQuestions: subject.questions, timerMinutes: subject.minutes });
     }
+  };
+  const applyExamName = (examName: ExamName) => {
+    patchSettings({ examName });
+  };
+  const toggleTier1Subject = (subjectName: string) => {
+    setSettings((current) => {
+      const selectedSubjects = current.selectedSubjects.includes(subjectName)
+        ? current.selectedSubjects.filter((subject) => subject !== subjectName)
+        : TIER1_SUBJECTS.filter((subject) => subject === subjectName || current.selectedSubjects.includes(subject));
+      const structure = getTier1Structure(selectedSubjects);
+      return {
+        ...current,
+        selectedSubjects,
+        ...(customOverride ? {} : structure),
+      };
+    });
   };
   const applySubject = (subjectName: string) => {
     const subject = SUBJECTS.find((item) => item.name === subjectName);
@@ -262,7 +294,10 @@ function App() {
     images: { page: number; data: string }[],
     signal: AbortSignal,
   ): Promise<ExtractedQuestion[]> => {
-    const prompt = `You are extracting questions from an SSC competitive exam candidate response sheet. Only include questions belonging to section "${settings.sectionName || settings.subject}" from the provided pages. Skip ads and promotional pages. Return ONLY valid JSON matching {"questions":[{"questionText":"...","options":["...","...","...","..."],"correctOptionIndex":1,"passageText":"..."}]}. correctOptionIndex is 1, 2, 3, or 4 based on the green official correct-answer tick (not the candidate's chosen answer). Scrub every checkmark, red cross, Question ID, Option ID, Status, Chosen Option, Adda247 and Google Play artifact from question/option text. Keep question and options clean. Express math in LaTeX with $...$ inline and $$...$$ display; preserve structured frequency tables as Markdown tables. Wrap any underlined English text in <u>...</u>. Attach the exact same passageText to every sub-question sharing a comprehension/cloze passage. Each question must have exactly four options. Do not invent missing content.`;
+    const tier1Scope = settings.tier === "Tier 1"
+      ? ` Only extract questions from these selected subjects/modules: ${settings.selectedSubjects.join(", ")}.`
+      : "";
+    const prompt = `You are extracting questions from an SSC competitive exam candidate response sheet. Only include questions belonging to section "${settings.sectionName || settings.subject}" from the provided pages.${tier1Scope} Skip ads and promotional pages. Return ONLY valid JSON matching {"questions":[{"questionText":"...","options":["...","...","...","..."],"correctOptionIndex":1,"passageText":"..."}]}. correctOptionIndex is 1, 2, 3, or 4 based on the green official correct-answer tick (not the candidate's chosen answer). Scrub every checkmark, red cross, Question ID, Option ID, Status, Chosen Option, Adda247 and Google Play artifact from question/option text. Keep question and options clean. Express math in LaTeX with $...$ inline and $$...$$ display; preserve structured frequency tables as Markdown tables. Wrap any underlined English text in <u>...</u>. Attach the exact same passageText to every sub-question sharing a comprehension/cloze passage. Each question must have exactly four options. Do not invent missing content.`;
     let response: Response;
     try {
       response = await fetch("/api/ai/extract", {
@@ -311,6 +346,10 @@ function App() {
 
   const generateMock = async () => {
     if (extractionInFlightRef.current) return;
+    if (settings.tier === "Tier 1" && settings.selectedSubjects.length === 0) {
+      setError("Select at least one subject to generate a Tier 1 mock.");
+      return;
+    }
     if (!file) {
       setError("Upload a candidate response sheet PDF to continue.");
       return;
@@ -348,7 +387,10 @@ function App() {
       setProgress("Extracting questions & scrubbing answer key...");
       const extracted = await extractQuestions(images, controller.signal);
       if (!extracted.length) throw new Error("No questions were found in this page range. Try adjusting the section name or pages.");
-      const normalized: Question[] = extracted.map((question, index) => ({
+      const extractedForStructure = settings.tier === "Tier 1"
+        ? extracted.slice(0, settings.expectedQuestions)
+        : extracted;
+      const normalized: Question[] = extractedForStructure.map((question, index) => ({
         id: `${Date.now()}-${index}`,
         questionText: scrubArtifacts(question.questionText),
         options: question.options.slice(0, 4).map(scrubArtifacts),
@@ -449,10 +491,6 @@ function App() {
     if (activeIndex < questions.length - 1) changeQuestion(activeIndex + 1);
   };
 
-  const clearResponse = () => setQuestions((current) => current.map((question, index) =>
-    index === activeIndex ? { ...question, selectedOption: undefined } : question,
-  ));
-
   const launchRetry = () => {
     if (!currentAttempt) return;
     const retry = currentAttempt.questions.filter((question) =>
@@ -497,7 +535,7 @@ function App() {
         <div className="exam-shell">
           <header className="exam-header">
             <div className="brand-lockup exam-brand"><div className="brand-mark"><Layers3 size={19} /></div><span>MockForge</span></div>
-            <div className="exam-title"><span>{settings.sectionName || settings.subject}</span><b>{settings.tier} <i>•</i> +{settings.positiveMarks} / -{settings.negativeMarks}</b></div>
+            <div className="exam-title"><span>{settings.sectionName || (settings.tier === "Tier 1" ? `${settings.examName}: ${settings.selectedSubjects.join(", ")}` : settings.subject)}</span><b>{settings.tier} <i>•</i> +{settings.positiveMarks} / -{settings.negativeMarks}</b></div>
             <div className="header-right">
               <span className="scheme-pill"><Check size={14} /> Correct: +{settings.positiveMarks} <span>·</span> Wrong: -{settings.negativeMarks}</span>
               <ThemeToggle theme={theme} onToggle={toggleTheme} />
@@ -508,7 +546,7 @@ function App() {
           <main className="exam-layout">
             <section className="question-workspace">
               <div className="workspace-topline">
-                <span className="workspace-section-name">SECTION: {settings.sectionName || settings.subject}</span>
+                <span className="workspace-section-name">SECTION: {settings.sectionName || (settings.tier === "Tier 1" ? `${settings.examName} Tier 1` : settings.subject)}</span>
                 <div className="workspace-toolbar">
                   <span className="workspace-question-count">{questions.length} QUESTIONS</span>
                   <div className="question-zoom-controls" role="group" aria-label="Question display zoom">
@@ -574,14 +612,12 @@ function App() {
                 </div>
               </div>
               <div className="control-bar">
-                <button className="btn btn-review" onClick={markAndNext}><ShieldCheck size={16} /><span>Mark for Review <em>&amp; Next</em></span></button>
-                <button className="btn btn-outline" onClick={clearResponse}>Clear Response</button>
+                <button className="btn btn-review" onClick={markAndNext}><ShieldCheck size={16} /><span>Mark for Review</span></button>
                 <div className="control-spacer" />
                 <button className="btn btn-light" onClick={() => changeQuestion(activeIndex - 1)} disabled={activeIndex === 0}><ArrowLeft size={16} /> Previous</button>
                 <button className="btn btn-primary" onClick={() => activeIndex < questions.length - 1 ? changeQuestion(activeIndex + 1) : setSubmitModal(true)}>
-                  Save &amp; Next <ArrowRight size={16} />
+                  Next <ArrowRight size={16} />
                 </button>
-                <button className="btn btn-submit" onClick={() => setSubmitModal(true)}>Submit Section</button>
               </div>
             </section>
             <aside className={`exam-sidebar ${mobilePaletteOpen ? "palette-open" : ""}`}>
@@ -617,6 +653,7 @@ function App() {
                   <span><i className="legend-box legend-answered-marked" />Answered &amp; Marked <b>{statusCount("answered-marked")}</b></span>
                 </div>
                 <div className="sidebar-footer"><span><CheckCircle2 size={15} />{answeredCount} of {questions.length} answered</span><span>{Math.round((answeredCount / questions.length) * 100)}%</span></div>
+                <button type="button" className="btn btn-submit palette-submit" onClick={() => setSubmitModal(true)}>Submit Section</button>
               </div>
             </aside>
           </main>
@@ -653,7 +690,7 @@ function App() {
             </div>
             {warning && <div className="setup-warning"><CircleHelp size={17} /><span>{warning}</span><button onClick={() => setWarning("")} aria-label="Dismiss warning"><X size={15} /></button></div>}
             <div className="ready-details">
-              <div className="ready-detail"><span>Subject</span><strong>{settings.subject}</strong></div>
+              <div className="ready-detail"><span>{settings.tier === "Tier 1" ? "Subjects" : "Subject"}</span><strong>{settings.tier === "Tier 1" ? settings.selectedSubjects.join(", ") : settings.subject}</strong></div>
               <div className="ready-detail"><span>Questions extracted</span><strong>{questions.length}</strong></div>
               <div className="ready-detail"><span>Expected questions</span><strong>{settings.expectedQuestions}</strong></div>
               <div className="ready-detail"><span>Duration</span><strong>{settings.untimed ? "Untimed practice" : `${settings.timerMinutes} minutes`}</strong></div>
@@ -745,10 +782,46 @@ function App() {
                   <button className={`tier-option ${settings.tier === tier ? "tier-active" : ""}`} onClick={() => applyTier(tier)} key={tier}>
                     <span className={`tier-radio ${settings.tier === tier ? "radio-active" : ""}`}>{settings.tier === tier && <i />}</span>
                     <span className="tier-info"><strong>{tier}</strong><small>{tier === "Tier 1" ? "+2.0 correct · −0.5 wrong" : "+3.0 correct · −1.0 wrong"}</small></span>
-                    <span className="tier-time"><Clock3 size={13} />{tier === "Tier 1" ? "15 min" : "Subject based"}</span>
+                    <span className="tier-time"><Clock3 size={13} />{tier === "Tier 1" ? "60 min" : "Subject based"}</span>
                   </button>
                 ))}
               </div>
+              {settings.tier === "Tier 1" && (
+                <>
+                  <div className="exam-name-options" role="group" aria-label="SSC exam">
+                    {(["SSC CGL", "SSC CHSL"] as ExamName[]).map((examName) => (
+                      <button
+                        type="button"
+                        key={examName}
+                        className={`exam-name-option ${settings.examName === examName ? "exam-name-active" : ""}`}
+                        aria-pressed={settings.examName === examName}
+                        onClick={() => applyExamName(examName)}
+                      >
+                        {examName}
+                      </button>
+                    ))}
+                  </div>
+                  <fieldset className="tier1-subjects">
+                    <legend>Subjects / modules</legend>
+                    <div className="tier1-subject-grid">
+                      {TIER1_SUBJECTS.map((subjectName) => {
+                        const selected = settings.selectedSubjects.includes(subjectName);
+                        return (
+                          <label className={`tier1-subject-option ${selected ? "tier1-subject-selected" : ""}`} key={subjectName}>
+                            <input
+                              type="checkbox"
+                              checked={selected}
+                              onChange={() => toggleTier1Subject(subjectName)}
+                            />
+                            <span className="subject-checkbox">{selected && <Check size={12} />}</span>
+                            <span>{subjectName}</span>
+                          </label>
+                        );
+                      })}
+                    </div>
+                  </fieldset>
+                </>
+              )}
               {settings.tier === "Tier 2" && (
                 <label className="field-label subject-field">Subject module
                   <span className="select-wrap"><select value={settings.subject} onChange={(event) => applySubject(event.target.value)}>{SUBJECTS.map((subject) => <option key={subject.name}>{subject.name}</option>)}</select><ChevronDown size={16} /></span>
@@ -788,7 +861,7 @@ function App() {
             {warning && <div className="setup-warning"><CircleHelp size={17} /><span>{warning}</span><button onClick={() => setWarning("")} aria-label="Dismiss warning"><X size={15} /></button></div>}
             {error && <div className="error-banner"><CircleHelp size={17} /><span>{error}</span><button onClick={() => setError("")} aria-label="Dismiss error"><X size={15} /></button></div>}
             {busy && <div className="progress-banner"><LoaderCircle size={17} className="spin" /><span>{progress}</span><button className="cancel-extraction" onClick={() => extractionControllerRef.current?.abort()}>Cancel</button></div>}
-            <button className="generate-btn" disabled={busy || !file} onClick={() => void generateMock()}>
+            <button className="generate-btn" disabled={busy || !file || (settings.tier === "Tier 1" && settings.selectedSubjects.length === 0)} onClick={() => void generateMock()}>
               {busy ? <><LoaderCircle size={17} className="spin" /> Building your mock...</> : <>Generate section mock <ArrowRight size={17} /></>}
             </button>
             <div className="privacy-note"><LockKeyhole size={13} />Selected pages only · Your response sheet stays private</div>

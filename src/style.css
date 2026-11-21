@@ -104,6 +104,17 @@ button:disabled { cursor: not-allowed; opacity: .48; }
 .select-wrap { position: relative; }
 .select-wrap select { appearance: none; padding-right: 30px; }
 .select-wrap svg { position: absolute; top: 10px; right: 9px; color: #8b97a8; pointer-events: none; }
+.exam-name-options { display: flex; gap: 8px; margin: 12px 0 0 32px; }
+.exam-name-option { min-height: 32px; padding: 0 12px; border: 1px solid #dde5ef; border-radius: 6px; color: #65748a; background: white; font-size: 10px; font-weight: 700; }
+.exam-name-active { border-color: #92b8ed; color: #326bb9; background: #f3f8ff; box-shadow: 0 0 0 2px #e9f2ff; }
+.tier1-subjects { margin: 12px 0 0 32px; padding: 10px; border: 1px solid #e7ebf1; border-radius: 8px; }
+.tier1-subjects legend { padding: 0 6px; color: #65748a; font-size: 9px; font-weight: 700; }
+.tier1-subject-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+.tier1-subject-option { min-height: 38px; display: flex; align-items: center; gap: 8px; padding: 7px 9px; border: 1px solid #e5e9ef; border-radius: 7px; color: #65748a; background: white; font-size: 10px; cursor: pointer; }
+.tier1-subject-option input { position: absolute; opacity: 0; pointer-events: none; }
+.tier1-subject-selected { border-color: #add0f6; background: #f6faff; color: #3d6599; }
+.subject-checkbox { width: 17px; height: 17px; display: grid; place-items: center; flex: 0 0 17px; border: 1px solid #cbd5e2; border-radius: 4px; background: white; color: #fff; }
+.tier1-subject-selected .subject-checkbox { border-color: #3e7fd5; background: #3e7fd5; }
 .custom-section { padding-top: 16px; border-top: 1px solid #eef0f4; }
 .custom-toggle { display: flex; align-items: center; gap: 10px; cursor: pointer; }
 .toggle-copy { display: flex; flex: 1; gap: 9px; align-items: center; }
@@ -291,6 +302,7 @@ button:disabled { cursor: not-allowed; opacity: .48; }
 .sidebar-footer { display: flex; justify-content: space-between; align-items: center; padding-top: 10px; border-top: 1px solid #edf0f4; color: #65778f; font-size: 8px; }
 .sidebar-footer span:first-child { display: flex; align-items: center; gap: 5px; }
 .sidebar-footer svg { color: #1b9b70; }
+.palette-submit { width: 100%; margin-top: 10px; }
 .warning-banner { margin: 0 13px; color: #896219; background: #fff8e9; border-bottom: 1px solid #f3e5c4; }
 .warning-banner button { margin-left: auto; }
 .spin { animation: spin 1s linear infinite; }
@@ -410,6 +422,7 @@ button:disabled { cursor: not-allowed; opacity: .48; }
   .custom-fields { padding-left: 0; grid-template-columns: 1fr 1fr; }
   .slicer-fields { padding-left: 0; grid-template-columns: 1fr; }
   .subject-field { margin-left: 0; }
+  .exam-name-options, .tier1-subjects { margin-left: 0; }
   .recent-section { margin-top: 25px; }
   .site-footer { margin-top: 24px; }
   .exam-header { height: 53px; flex-basis: 53px; padding: 0 13px; }
@@ -764,6 +777,12 @@ button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible
 :root[data-theme="dark"] .field-label input:focus,
 :root[data-theme="dark"] .field-label select:focus { border-color: #6e9bd7; box-shadow: 0 0 0 3px #5486c326; }
 :root[data-theme="dark"] .field-label select option { color: var(--text-primary); background: var(--surface); }
+ :root[data-theme="dark"] .exam-name-option,
+ :root[data-theme="dark"] .tier1-subject-option { color: var(--text-secondary); border-color: var(--border); background: var(--surface); }
+ :root[data-theme="dark"] .exam-name-active,
+ :root[data-theme="dark"] .tier1-subject-selected { color: #a9c5ee; border-color: #577da8; background: #1d2d40; }
+ :root[data-theme="dark"] .tier1-subjects { border-color: var(--border); }
+ :root[data-theme="dark"] .subject-checkbox { border-color: #627184; background: var(--surface-input); }
 :root[data-theme="dark"] .select-wrap svg { color: var(--text-muted); }
 :root[data-theme="dark"] .custom-section,
 :root[data-theme="dark"] .how-steps,
@@ -928,6 +947,9 @@ button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible
   .tier-option { min-height: 60px; padding: 8px; }
   .tier-info small { font-size: 10px; white-space: normal; }
   .field-label input, .field-label select { height: 44px; font-size: 14px; }
+  .tier1-subject-grid { grid-template-columns: 1fr; }
+  .tier1-subject-option { min-height: 44px; font-size: 12px; }
+  .exam-name-option { min-height: 42px; flex: 1; font-size: 12px; }
   .upload-copy strong { max-width: 170px; }
   .browse-btn { min-height: 40px; padding: 0 9px; font-size: 12px; }
   .passage-lock { font-size: 0; }
